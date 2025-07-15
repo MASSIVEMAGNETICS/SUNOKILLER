@@ -1,0 +1,9 @@
+torch
+librosa
+fastapi
+uvicorn
+python-multipart
+g2p-en
+transformers
+soundfile
+huggingface_hub
