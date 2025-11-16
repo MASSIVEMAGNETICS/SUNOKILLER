@@ -1,0 +1,67 @@
+# Model Configuration for SUNOKILLER
+
+# Vocoder (Vocos) Configuration
+vocoder:
+  type: "vocos"
+  input_channels: 80  # Mel-spectrogram bins
+  dim: 512
+  intermediate_dim: 1536
+  num_layers: 8
+  n_fft: 1024
+  hop_length: 256
+
+# Diffusion Model Configuration
+diffusion:
+  type: "diffwave"
+  in_channels: 1  # Mono audio
+  cond_channels: 80  # Mel-spectrogram bins
+  num_steps: 50  # Reduced for fast inference
+  beta_start: 0.0001
+  beta_end: 0.02
+  base_channels: 128
+  channel_mult: [1, 2, 4, 8]
+  num_res_blocks: 2
+
+# Text-to-Music Model Configuration
+text_to_music:
+  type: "transformer"
+  vocab_size: 2048
+  dim: 768
+  num_layers: 12
+  num_heads: 12
+  output_dim: 80  # Mel-spectrogram bins
+  max_seq_len: 2048
+  text_encoder_name: "t5-base"
+  dropout: 0.1
+
+# Training Configuration
+training:
+  batch_size: 8
+  learning_rate: 0.0001
+  num_epochs: 100
+  warmup_steps: 1000
+  gradient_clip: 1.0
+  save_every: 1000
+  eval_every: 500
+
+# Audio Configuration
+audio:
+  sample_rate: 24000
+  n_fft: 1024
+  hop_length: 256
+  n_mels: 80
+  fmin: 0
+  fmax: 12000
+
+# Quantization Configuration
+quantization:
+  enabled: false
+  type: "dynamic"  # Options: dynamic, static, fp16
+  
+# Inference Configuration
+inference:
+  device: "auto"  # auto, cpu, cuda, mps
+  num_diffusion_steps: 50
+  temperature: 1.0
+  top_k: 50
+  guidance_scale: 3.0

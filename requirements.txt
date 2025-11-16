@@ -1,0 +1,38 @@
+# Core Dependencies
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Audio Processing
+librosa>=0.10.0
+soundfile>=0.12.0
+audioread>=3.0.0
+
+# Model Optimization & Inference
+onnx>=1.14.0
+onnxruntime>=1.15.0
+optimum>=1.12.0
+
+# Diffusion Models
+diffusers>=0.21.0
+accelerate>=0.20.0
+
+# Transformers & NLP
+transformers>=4.30.0
+tokenizers>=0.13.0
+sentencepiece>=0.1.99
+
+# Scientific Computing
+einops>=0.6.1
+scipy>=1.10.0
+
+# Utilities
+pyyaml>=6.0
+tqdm>=4.65.0
+matplotlib>=3.7.0
+wandb>=0.15.0
+
+# Optional: For advanced optimization
+# tensorrt>=8.6.0  # NVIDIA GPUs only
+# coremltools>=6.3  # Apple devices only
