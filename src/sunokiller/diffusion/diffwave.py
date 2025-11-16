@@ -40,7 +40,8 @@ class ResidualBlock(nn.Module):
     
     def __init__(
         self,
-        channels: int,
+        in_channels: int,
+        out_channels: int,
         cond_channels: int,
         time_emb_dim: int,
         kernel_size: int = 3,
@@ -48,20 +49,23 @@ class ResidualBlock(nn.Module):
     ):
         super().__init__()
         self.conv1 = nn.Conv1d(
-            channels, channels, kernel_size,
+            in_channels, out_channels, kernel_size,
             padding=dilation * (kernel_size - 1) // 2,
             dilation=dilation
         )
-        self.conv2 = nn.Conv1d(channels, channels, 1)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, 1)
         
         # Time embedding projection
         self.time_mlp = nn.Sequential(
-            nn.Linear(time_emb_dim, channels),
+            nn.Linear(time_emb_dim, out_channels),
             nn.SiLU(),
         )
         
         # Conditional input projection (e.g., mel-spectrogram)
-        self.cond_conv = nn.Conv1d(cond_channels, channels, 1) if cond_channels > 0 else None
+        self.cond_conv = nn.Conv1d(cond_channels, out_channels, 1) if cond_channels > 0 else None
+        
+        # Residual connection if input/output channels differ
+        self.skip_conv = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
         
     def forward(
         self,
@@ -84,6 +88,10 @@ class ResidualBlock(nn.Module):
             
         h = F.silu(h)
         h = self.conv2(h)
+        
+        # Apply skip connection
+        if self.skip_conv is not None:
+            residual = self.skip_conv(residual)
         
         return h + residual
 
@@ -123,19 +131,19 @@ class DiffusionUNet(nn.Module):
             
             for _ in range(num_res_blocks):
                 self.down_blocks.append(
-                    ResidualBlock(now_channels, cond_channels, time_emb_dim)
+                    ResidualBlock(now_channels, out_channels, cond_channels, time_emb_dim)
                 )
+                now_channels = out_channels
                 channels.append(now_channels)
                 
             if i != len(channel_mult) - 1:
                 self.down_blocks.append(nn.Conv1d(now_channels, out_channels, 3, stride=2, padding=1))
-                now_channels = out_channels
                 channels.append(now_channels)
         
         # Middle blocks
         self.mid_blocks = nn.ModuleList([
-            ResidualBlock(now_channels, cond_channels, time_emb_dim),
-            ResidualBlock(now_channels, cond_channels, time_emb_dim),
+            ResidualBlock(now_channels, now_channels, cond_channels, time_emb_dim),
+            ResidualBlock(now_channels, now_channels, cond_channels, time_emb_dim),
         ])
         
         # Upsampling blocks
@@ -144,9 +152,10 @@ class DiffusionUNet(nn.Module):
         for i, mult in enumerate(reversed(channel_mult)):
             out_channels = base_channels * mult
             
-            for _ in range(num_res_blocks + 1):
+            for j in range(num_res_blocks + 1):
+                skip_channels = channels.pop()
                 self.up_blocks.append(
-                    ResidualBlock(now_channels + channels.pop(), cond_channels, time_emb_dim)
+                    ResidualBlock(now_channels + skip_channels, out_channels, cond_channels, time_emb_dim)
                 )
                 now_channels = out_channels
                 
