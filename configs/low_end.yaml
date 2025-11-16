@@ -1,0 +1,57 @@
+# Optimized configuration for low-end hardware
+
+# Vocoder - Reduced model size
+vocoder:
+  type: "vocos"
+  input_channels: 80
+  dim: 256  # Reduced from 512
+  intermediate_dim: 768  # Reduced from 1536
+  num_layers: 6  # Reduced from 8
+  n_fft: 1024
+  hop_length: 256
+
+# Diffusion Model - Faster inference
+diffusion:
+  type: "diffwave"
+  in_channels: 1
+  cond_channels: 80
+  num_steps: 25  # Reduced from 50 for faster generation
+  beta_start: 0.0001
+  beta_end: 0.02
+  base_channels: 64  # Reduced from 128
+  channel_mult: [1, 2, 4]  # Reduced depth
+  num_res_blocks: 1  # Reduced from 2
+
+# Text-to-Music - Smaller model
+text_to_music:
+  type: "transformer"
+  vocab_size: 2048
+  dim: 512  # Reduced from 768
+  num_layers: 6  # Reduced from 12
+  num_heads: 8  # Reduced from 12
+  output_dim: 80
+  max_seq_len: 1024  # Reduced from 2048
+  text_encoder_name: "t5-small"  # Smaller encoder
+  dropout: 0.1
+
+# Audio Configuration
+audio:
+  sample_rate: 22050  # Slightly reduced for efficiency
+  n_fft: 1024
+  hop_length: 256
+  n_mels: 80
+  fmin: 0
+  fmax: 11025
+
+# Quantization - Enabled by default
+quantization:
+  enabled: true
+  type: "fp16"  # FP16 for good balance of speed and quality
+
+# Inference - Optimized settings
+inference:
+  device: "cpu"  # Default to CPU for compatibility
+  num_diffusion_steps: 25  # Reduced for speed
+  temperature: 1.0
+  top_k: 30  # Reduced for faster sampling
+  guidance_scale: 2.5
