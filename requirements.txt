@@ -33,6 +33,9 @@ tqdm>=4.65.0
 matplotlib>=3.7.0
 wandb>=0.15.0
 
+# Web UI
+flask>=2.3.0
+
 # Optional: For advanced optimization
 # tensorrt>=8.6.0  # NVIDIA GPUs only
 # coremltools>=6.3  # Apple devices only
