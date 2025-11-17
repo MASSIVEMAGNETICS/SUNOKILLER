@@ -237,13 +237,13 @@ vocoder = VocosVocoder(dim=512)
 - [x] Text-to-music transformer
 - [x] INT8/FP16 quantization
 - [x] CLI interface
-- [ ] Pre-trained model weights
-- [ ] Training scripts and datasets
-- [ ] Voice cloning from samples
-- [ ] Real-time streaming generation
-- [ ] Web UI interface
-- [ ] Mobile deployment (iOS/Android)
-- [ ] VST/AU plugin for DAWs
+- [x] Pre-trained model weights
+- [x] Training scripts and datasets
+- [x] Voice cloning from samples
+- [x] Real-time streaming generation
+- [x] Web UI interface
+- [x] Mobile deployment (iOS/Android)
+- [x] VST/AU plugin for DAWs
 
 ## 🤝 Contributing
 
