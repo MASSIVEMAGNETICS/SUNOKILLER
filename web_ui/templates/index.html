@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SUNOKILLER - AI Music Generator</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+        
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+        
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 30px;
+            border-bottom: 2px solid #eee;
+        }
+        
+        .tab {
+            padding: 10px 20px;
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+            color: #666;
+            transition: all 0.3s;
+        }
+        
+        .tab.active {
+            color: #667eea;
+            border-bottom: 3px solid #667eea;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 600;
+        }
+        
+        input[type="text"],
+        textarea,
+        select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        input[type="text"]:focus,
+        textarea:focus,
+        select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        textarea {
+            min-height: 100px;
+            resize: vertical;
+        }
+        
+        .slider-group {
+            margin-bottom: 20px;
+        }
+        
+        input[type="range"] {
+            width: 100%;
+            margin-top: 10px;
+        }
+        
+        .slider-value {
+            text-align: right;
+            color: #667eea;
+            font-weight: 600;
+        }
+        
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            font-size: 18px;
+            border-radius: 8px;
+            cursor: pointer;
+            width: 100%;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
+        .status {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 8px;
+            display: none;
+        }
+        
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        
+        audio {
+            width: 100%;
+            margin-top: 15px;
+            border-radius: 8px;
+        }
+        
+        .download-btn {
+            background: #28a745;
+            margin-top: 10px;
+        }
+        
+        .upload-area {
+            border: 2px dashed #ddd;
+            border-radius: 8px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .upload-area:hover {
+            border-color: #667eea;
+            background: #f8f9ff;
+        }
+        
+        .upload-area.dragover {
+            border-color: #667eea;
+            background: #f0f3ff;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎵 SUNOKILLER</h1>
+        <p class="subtitle">AI-Powered Music & Voice Synthesis</p>
+        
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('music')">Generate Music</button>
+            <button class="tab" onclick="switchTab('singing')">Singing Voice</button>
+            <button class="tab" onclick="switchTab('enhance')">Enhance Audio</button>
+        </div>
+        
+        <!-- Music Generation Tab -->
+        <div id="music-tab" class="tab-content active">
+            <form id="music-form">
+                <div class="form-group">
+                    <label for="music-text">Describe the music you want:</label>
+                    <textarea 
+                        id="music-text" 
+                        placeholder="e.g., upbeat pop song with electric guitar and drums"
+                        required
+                    ></textarea>
+                </div>
+                
+                <div class="slider-group">
+                    <label for="music-duration">
+                        Duration: <span class="slider-value" id="music-duration-value">10s</span>
+                    </label>
+                    <input 
+                        type="range" 
+                        id="music-duration" 
+                        min="5" 
+                        max="30" 
+                        value="10" 
+                        step="1"
+                        oninput="updateSlider('music-duration', this.value, 's')"
+                    >
+                </div>
+                
+                <div class="slider-group">
+                    <label for="music-temperature">
+                        Creativity: <span class="slider-value" id="music-temperature-value">1.0</span>
+                    </label>
+                    <input 
+                        type="range" 
+                        id="music-temperature" 
+                        min="0.5" 
+                        max="1.5" 
+                        value="1.0" 
+                        step="0.1"
+                        oninput="updateSlider('music-temperature', this.value, '')"
+                    >
+                </div>
+                
+                <button type="submit">Generate Music</button>
+            </form>
+            
+            <div id="music-status" class="status"></div>
+            <div id="music-player"></div>
+        </div>
+        
+        <!-- Singing Voice Tab -->
+        <div id="singing-tab" class="tab-content">
+            <form id="singing-form">
+                <div class="form-group">
+                    <label for="lyrics">Lyrics:</label>
+                    <textarea 
+                        id="lyrics" 
+                        placeholder="e.g., Happy birthday to you, happy birthday to you"
+                        required
+                    ></textarea>
+                </div>
+                
+                <div class="form-group">
+                    <label for="voice-style">Voice Style:</label>
+                    <select id="voice-style">
+                        <option value="neutral">Neutral</option>
+                        <option value="male">Male</option>
+                        <option value="female">Female</option>
+                        <option value="choir">Choir</option>
+                    </select>
+                </div>
+                
+                <div class="slider-group">
+                    <label for="singing-duration">
+                        Duration: <span class="slider-value" id="singing-duration-value">10s</span>
+                    </label>
+                    <input 
+                        type="range" 
+                        id="singing-duration" 
+                        min="5" 
+                        max="30" 
+                        value="10" 
+                        step="1"
+                        oninput="updateSlider('singing-duration', this.value, 's')"
+                    >
+                </div>
+                
+                <button type="submit">Generate Singing</button>
+            </form>
+            
+            <div id="singing-status" class="status"></div>
+            <div id="singing-player"></div>
+        </div>
+        
+        <!-- Enhance Audio Tab -->
+        <div id="enhance-tab" class="tab-content">
+            <div class="upload-area" id="upload-area">
+                <p>📁 Click or drag audio file here</p>
+                <input type="file" id="audio-file" accept="audio/*" style="display: none;">
+            </div>
+            
+            <button id="enhance-btn" style="margin-top: 20px;" disabled>Enhance Audio</button>
+            
+            <div id="enhance-status" class="status"></div>
+            <div id="enhance-player"></div>
+        </div>
+    </div>
+    
+    <script>
+        let currentFileId = null;
+        let uploadedFile = null;
+        
+        function switchTab(tabName) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            
+            // Show selected tab
+            document.getElementById(tabName + '-tab').classList.add('active');
+            event.target.classList.add('active');
+        }
+        
+        function updateSlider(id, value, suffix) {
+            document.getElementById(id + '-value').textContent = value + suffix;
+        }
+        
+        function showStatus(tabName, type, message) {
+            const status = document.getElementById(tabName + '-status');
+            status.className = 'status ' + type;
+            status.textContent = message;
+            status.style.display = 'block';
+        }
+        
+        function showPlayer(tabName, fileId) {
+            const player = document.getElementById(tabName + '-player');
+            player.innerHTML = `
+                <audio controls>
+                    <source src="/download/${fileId}" type="audio/wav">
+                </audio>
+                <button class="download-btn" onclick="window.location.href='/download/${fileId}'">
+                    Download Audio
+                </button>
+            `;
+        }
+        
+        // Music form
+        document.getElementById('music-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const text = document.getElementById('music-text').value;
+            const duration = parseFloat(document.getElementById('music-duration').value);
+            const temperature = parseFloat(document.getElementById('music-temperature').value);
+            
+            const btn = e.target.querySelector('button');
+            btn.disabled = true;
+            btn.textContent = 'Generating...';
+            
+            showStatus('music', 'info', 'Generating music... This may take a minute.');
+            
+            try {
+                const response = await fetch('/generate', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        text, duration, temperature, mode: 'music'
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showStatus('music', 'success', data.message);
+                    showPlayer('music', data.file_id);
+                } else {
+                    showStatus('music', 'error', data.error || 'Generation failed');
+                }
+            } catch (error) {
+                showStatus('music', 'error', 'Error: ' + error.message);
+            }
+            
+            btn.disabled = false;
+            btn.textContent = 'Generate Music';
+        });
+        
+        // Singing form
+        document.getElementById('singing-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const text = document.getElementById('lyrics').value;
+            const duration = parseFloat(document.getElementById('singing-duration').value);
+            const voice_style = document.getElementById('voice-style').value;
+            
+            const btn = e.target.querySelector('button');
+            btn.disabled = true;
+            btn.textContent = 'Generating...';
+            
+            showStatus('singing', 'info', 'Generating singing voice...');
+            
+            try {
+                const response = await fetch('/generate', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        text, duration, voice_style, mode: 'singing'
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showStatus('singing', 'success', data.message);
+                    showPlayer('singing', data.file_id);
+                } else {
+                    showStatus('singing', 'error', data.error || 'Generation failed');
+                }
+            } catch (error) {
+                showStatus('singing', 'error', 'Error: ' + error.message);
+            }
+            
+            btn.disabled = false;
+            btn.textContent = 'Generate Singing';
+        });
+        
+        // File upload
+        const uploadArea = document.getElementById('upload-area');
+        const fileInput = document.getElementById('audio-file');
+        const enhanceBtn = document.getElementById('enhance-btn');
+        
+        uploadArea.addEventListener('click', () => fileInput.click());
+        
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                uploadedFile = e.target.files[0];
+                uploadArea.innerHTML = `<p>✓ ${uploadedFile.name}</p>`;
+                enhanceBtn.disabled = false;
+            }
+        });
+        
+        // Drag and drop
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            
+            if (e.dataTransfer.files.length > 0) {
+                uploadedFile = e.dataTransfer.files[0];
+                uploadArea.innerHTML = `<p>✓ ${uploadedFile.name}</p>`;
+                enhanceBtn.disabled = false;
+            }
+        });
+        
+        // Enhance button
+        enhanceBtn.addEventListener('click', async () => {
+            if (!uploadedFile) return;
+            
+            enhanceBtn.disabled = true;
+            enhanceBtn.textContent = 'Enhancing...';
+            
+            showStatus('enhance', 'info', 'Enhancing audio...');
+            
+            const formData = new FormData();
+            formData.append('audio', uploadedFile);
+            
+            try {
+                const response = await fetch('/enhance', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showStatus('enhance', 'success', data.message);
+                    showPlayer('enhance', data.file_id);
+                } else {
+                    showStatus('enhance', 'error', data.error || 'Enhancement failed');
+                }
+            } catch (error) {
+                showStatus('enhance', 'error', 'Error: ' + error.message);
+            }
+            
+            enhanceBtn.disabled = false;
+            enhanceBtn.textContent = 'Enhance Audio';
+        });
+    </script>
+</body>
+</html>
