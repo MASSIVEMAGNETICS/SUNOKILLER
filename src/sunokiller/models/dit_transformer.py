@@ -189,7 +189,7 @@ class DiTBlock(nn.Module):
         self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
         
         # 4. Adaptive Layer Norm (AdaLN) Zero
-        # Regulates the shift and scale of the block based on timestep
+        # Produces 6 modulation parameters: shift/scale/gate for self-attn and MLP
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(dim, 6 * dim, bias=True) 
@@ -207,7 +207,8 @@ class DiTBlock(nn.Module):
         """
         # Calculate modulation parameters from timestep
         # shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
-        shift_msa, scale_msa, gate_msa, shift_cross, scale_cross, gate_cross = self.adaLN_modulation(t_emb).chunk(6, dim=1)
+        modulation = self.adaLN_modulation(t_emb).chunk(6, dim=1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation
         
         # -------------------------------------------------------
         # 1. Self-Attention
@@ -239,8 +240,6 @@ class DiTBlock(nn.Module):
         # -------------------------------------------------------
         if context is not None:
             x_norm = self.norm_cross(x)
-            # In DiT, we usually don't modulate cross norm, but we can:
-            # x_norm = x_norm * (1 + scale_cross.unsqueeze(1)) + shift_cross.unsqueeze(1)
             
             q = self.cross_q(x_norm).reshape(x.shape[0], x.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
             
@@ -257,14 +256,11 @@ class DiTBlock(nn.Module):
                 out = (attn @ v_c)
             
             out = out.transpose(1, 2).reshape(x.shape[0], x.shape[1], -1)
-            x = x + self.cross_proj(out)  # Or gated
+            x = x + self.cross_proj(out)
 
         # -------------------------------------------------------
         # 3. MLP (SwiGLU)
         # -------------------------------------------------------
-        # Reuse modulation params for simplicity in this example or split chunks differently
-        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(t_emb).chunk(6, dim=1)[3:]
-        
         x_norm = self.norm2(x)
         x_norm = x_norm * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm)
