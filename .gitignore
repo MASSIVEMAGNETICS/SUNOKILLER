@@ -43,7 +43,10 @@ ENV/
 *.mlmodel
 checkpoints/
 weights/
-models/
+# Ignore model weight directories but not source code
+/models/
+data/models/
+pretrained_models/
 
 # Data and outputs
 data/
