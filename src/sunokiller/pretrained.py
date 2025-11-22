@@ -235,7 +235,7 @@ def create_model_from_pretrained(
     Example:
         >>> vocoder = create_model_from_pretrained("vocos-24khz")
     """
-    from ..models import VocosVocoder, DiffusionModel, TextToMusicModel
+    from .models import VocosVocoder, DiffusionModel, TextToMusicModel
     
     config = load_config(model_name)
     
