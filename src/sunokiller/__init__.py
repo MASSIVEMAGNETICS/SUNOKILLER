@@ -18,7 +18,7 @@ Based on latest research from 2024-2025.
 __version__ = "0.1.0"
 __author__ = "MASSIVEMAGNETICS"
 
-from .models import VocosVocoder, DiffusionModel, TextToMusicModel
+from .models import VocosVocoder, DiffusionModel, TextToMusicModel, MusicDiffusionTransformer
 from .synthesis import AudioSynthesizer
 from .quantization import quantize_model
 from .pretrained import (
@@ -34,6 +34,7 @@ __all__ = [
     "VocosVocoder",
     "DiffusionModel", 
     "TextToMusicModel",
+    "MusicDiffusionTransformer",
     
     # Synthesis
     "AudioSynthesizer",
