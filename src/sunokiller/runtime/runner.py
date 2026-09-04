@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha256
 import json
 import os
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .contracts import CapabilityLease, ExecutionReceipt, HMACAuthority, digest_json
-from .state import SQLiteStateStore
+from .state import NO_SNAPSHOT_PRECONDITION, SQLiteStateStore
 
 
 class WorkerExecutionError(RuntimeError):
@@ -158,16 +158,13 @@ class IsolatedRunner:
             snapshot = self.state_store.save_snapshot(
                 self.state_key,
                 proposed_state,
-                expected_hash=pre.state_hash if pre else None,
+                expected_hash=pre.state_hash if pre else NO_SNAPSHOT_PRECONDITION,
             )
             post_hash = snapshot.state_hash
 
         finished = int(time.time())
-        receipt_seed = "{}:{}:{}:{}".format(
-            lease.lease_id, started, worker.worker_id, input_hash
-        )
         receipt = ExecutionReceipt(
-            execution_id="EXEC-" + sha256(receipt_seed.encode("utf-8")).hexdigest()[:24],
+            execution_id="EXEC-" + uuid.uuid4().hex,
             lease_id=lease.lease_id,
             worker=worker.worker_id,
             capability=worker.capability,
