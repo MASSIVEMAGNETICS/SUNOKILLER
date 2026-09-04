@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
-import importlib
-import multiprocessing as mp
+import json
 import os
+import subprocess
+import sys
 import time
 from typing import Any, Dict, Mapping, Optional, Tuple
 
@@ -37,57 +38,50 @@ class WorkerSpec:
         return "{}:{}".format(self.module, self.function)
 
 
-def _apply_resource_limits(
-    max_memory_mb: Optional[int],
-    max_cpu_seconds: Optional[int],
-) -> None:
-    try:
-        import resource  # POSIX only
-    except ImportError:
-        return
-
-    if max_memory_mb:
-        limit = int(max_memory_mb) * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-    if max_cpu_seconds:
-        cpu = int(max_cpu_seconds)
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-
-
-def _minimize_environment() -> None:
+def _minimal_environment() -> Dict[str, str]:
     allowed = {}
-    for key in ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR"):
+    for key in (
+        "PATH",
+        "PYTHONPATH",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+    ):
         value = os.environ.get(key)
         if value:
             allowed[key] = value
-    os.environ.clear()
-    os.environ.update(allowed)
+    return allowed
 
 
-def _worker_entry(
-    conn: Any,
-    module: str,
-    function: str,
-    payload: Dict[str, Any],
+def _resource_limiter(
     max_memory_mb: Optional[int],
     max_cpu_seconds: Optional[int],
-) -> None:
-    try:
-        _apply_resource_limits(max_memory_mb, max_cpu_seconds)
-        _minimize_environment()
-        target = getattr(importlib.import_module(module), function)
-        result = target(payload)
-        if not isinstance(result, dict):
-            raise TypeError("worker must return a dict")
-        conn.send({"ok": True, "result": result})
-    except BaseException as exc:
-        conn.send({"ok": False, "error": "{}: {}".format(type(exc).__name__, exc)})
-    finally:
-        conn.close()
+):
+    if os.name != "posix":
+        return None
+
+    def apply_limits() -> None:
+        import resource
+
+        if max_memory_mb:
+            limit = int(max_memory_mb) * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+        if max_cpu_seconds:
+            cpu = int(max_cpu_seconds)
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+
+    return apply_limits
 
 
 class IsolatedRunner:
-    """Run an authorized worker in a child process with external state commit."""
+    """Run an authorized worker in a separate interpreter process.
+
+    The child receives only the JSON job payload and a minimized environment.
+    It cannot write canonical state directly; it may only propose `_state`,
+    which the parent commits transactionally after successful execution.
+    """
 
     def __init__(
         self,
@@ -117,41 +111,43 @@ class IsolatedRunner:
         pre = self.state_store.load_latest(self.state_key)
         pre_hash = pre.state_hash if pre else digest_json({})
         started = int(time.time())
-        input_hash = digest_json(dict(payload))
+        input_payload = dict(payload)
+        input_hash = digest_json(input_payload)
 
-        ctx = mp.get_context("spawn")
-        parent_conn, child_conn = ctx.Pipe(duplex=False)
-        process = ctx.Process(
-            target=_worker_entry,
-            args=(
-                child_conn,
-                worker.module,
-                worker.function,
-                dict(payload),
-                worker.max_memory_mb,
-                worker.max_cpu_seconds,
-            ),
-        )
-        process.start()
-        child_conn.close()
+        envelope = {
+            "module": worker.module,
+            "function": worker.function,
+            "payload": input_payload,
+        }
 
-        message = None
         try:
-            if not parent_conn.poll(worker.timeout_seconds):
-                process.terminate()
-                process.join(timeout=2.0)
-                raise WorkerTimeout(worker.worker_id)
-            message = parent_conn.recv()
-        finally:
-            parent_conn.close()
-            process.join(timeout=2.0)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=1.0)
+            completed = subprocess.run(
+                [sys.executable, "-m", "sunokiller.runtime.worker_entry"],
+                input=json.dumps(envelope),
+                text=True,
+                capture_output=True,
+                timeout=worker.timeout_seconds,
+                env=_minimal_environment(),
+                check=False,
+                preexec_fn=_resource_limiter(
+                    worker.max_memory_mb,
+                    worker.max_cpu_seconds,
+                ),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise WorkerTimeout(worker.worker_id) from exc
 
-        if not message or not message.get("ok"):
-            error = message.get("error", "unknown worker error") if message else "no worker response"
+        if completed.returncode != 0:
+            error = completed.stderr.strip() or completed.stdout.strip() or "worker failed"
             raise WorkerExecutionError(error)
+
+        try:
+            message = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise WorkerExecutionError("worker returned invalid JSON") from exc
+
+        if not message.get("ok"):
+            raise WorkerExecutionError(message.get("error", "unknown worker error"))
 
         result = dict(message["result"])
         proposed_state = result.pop("_state", None)
@@ -184,5 +180,4 @@ class IsolatedRunner:
             output_hash=digest_json(result),
             status="SUCCESS",
         )
-        signed = self.authority.sign_receipt(receipt)
-        return result, signed
+        return result, self.authority.sign_receipt(receipt)
