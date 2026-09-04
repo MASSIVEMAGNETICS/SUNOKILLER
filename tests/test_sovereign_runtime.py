@@ -1,6 +1,7 @@
 import dataclasses
 import os
 import tempfile
+import threading
 import time
 import unittest
 
@@ -12,7 +13,7 @@ from sunokiller.runtime.contracts import (
     LeaseRevoked,
     ResourceDenied,
 )
-from sunokiller.runtime.state import StateConflict
+from sunokiller.runtime.state import NO_SNAPSHOT_PRECONDITION, StateConflict
 from sunokiller.omen import build_master_command
 
 
@@ -37,6 +38,24 @@ class CapabilityBoundaryTests(unittest.TestCase):
             capabilities=["audio.master"],
             resource_scopes=["catalog/masters"],
             ttl_seconds=ttl,
+        )
+
+    def runner(self):
+        return IsolatedRunner(
+            authority=self.authority,
+            state_store=self.store,
+            state_key="runtime",
+        )
+
+    def demo_worker(self):
+        return WorkerSpec(
+            module="sunokiller.runtime.demo_worker",
+            function="update_counter",
+            capability="audio.master",
+            resource="catalog/masters/demo",
+            timeout_seconds=5,
+            max_memory_mb=None,
+            max_cpu_seconds=None,
         )
 
     def test_authorized_lease(self):
@@ -109,12 +128,41 @@ class CapabilityBoundaryTests(unittest.TestCase):
         with self.assertRaises(StateConflict):
             self.store.save_snapshot("runtime", {"v": 3}, expected_hash=first.state_hash)
 
-    def test_receipt_tampering_rejected(self):
-        runner = IsolatedRunner(
-            authority=self.authority,
-            state_store=self.store,
-            state_key="runtime",
+    def test_empty_state_precondition_rejected_after_first_writer(self):
+        first = self.store.save_snapshot(
+            "fresh-runtime",
+            {"writer": 1},
+            expected_hash=NO_SNAPSHOT_PRECONDITION,
         )
+        self.assertEqual(first.version, 1)
+        with self.assertRaises(StateConflict):
+            self.store.save_snapshot(
+                "fresh-runtime",
+                {"writer": 2},
+                expected_hash=NO_SNAPSHOT_PRECONDITION,
+            )
+
+    def test_revocation_uses_state_store_lock(self):
+        lease = self.issue()
+        started = threading.Event()
+        finished = threading.Event()
+
+        def revoke():
+            started.set()
+            self.store.revoke_lease(lease.lease_id, "human stop")
+            finished.set()
+
+        with self.store._lock:
+            thread = threading.Thread(target=revoke)
+            thread.start()
+            self.assertTrue(started.wait(timeout=1.0))
+            self.assertFalse(finished.wait(timeout=0.05))
+        thread.join(timeout=1.0)
+        self.assertTrue(finished.is_set())
+        self.assertTrue(self.store.is_revoked(lease.lease_id))
+
+    def test_receipt_tampering_rejected(self):
+        runner = self.runner()
         lease = self.authority.issue_lease(
             subject="demo",
             capabilities=["audio.master"],
@@ -122,15 +170,7 @@ class CapabilityBoundaryTests(unittest.TestCase):
         )
         result, receipt = runner.execute(
             lease=lease,
-            worker=WorkerSpec(
-                module="sunokiller.runtime.demo_worker",
-                function="update_counter",
-                capability="audio.master",
-                resource="catalog/masters/demo",
-                timeout_seconds=5,
-                max_memory_mb=None,
-                max_cpu_seconds=None,
-            ),
+            worker=self.demo_worker(),
             payload={"value": 4},
         )
         self.assertEqual(result["value"], 5)
@@ -138,6 +178,27 @@ class CapabilityBoundaryTests(unittest.TestCase):
         tampered = dataclasses.replace(receipt, output_hash="0" * 64)
         with self.assertRaises(InvalidSignature):
             self.authority.verify_receipt(tampered)
+
+    def test_execution_ids_unique_for_identical_invocations(self):
+        runner = self.runner()
+        lease = self.authority.issue_lease(
+            subject="demo",
+            capabilities=["audio.master"],
+            resource_scopes=["catalog/masters"],
+        )
+        _, first = runner.execute(
+            lease=lease,
+            worker=self.demo_worker(),
+            payload={"value": 4},
+        )
+        _, second = runner.execute(
+            lease=lease,
+            worker=self.demo_worker(),
+            payload={"value": 4},
+        )
+        self.assertNotEqual(first.execution_id, second.execution_id)
+        self.authority.verify_receipt(first)
+        self.authority.verify_receipt(second)
 
 
 class OmenHarnessTests(unittest.TestCase):
