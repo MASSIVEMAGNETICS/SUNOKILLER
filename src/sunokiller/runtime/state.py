@@ -16,6 +16,11 @@ class StateConflict(RuntimeError):
     pass
 
 
+# Optimistic-concurrency sentinel meaning: this write is valid only if the
+# state key has never had a snapshot. This is intentionally not a hash value.
+NO_SNAPSHOT_PRECONDITION = "__NO_SNAPSHOT__"
+
+
 @dataclass(frozen=True)
 class StateSnapshot:
     key: str
@@ -54,19 +59,21 @@ class SQLiteStateStore:
         )
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def load_latest(self, key: str) -> Optional[StateSnapshot]:
-        row = self._conn.execute(
-            """
-            SELECT key, version, state_json, state_hash, created_at
-            FROM state_snapshots
-            WHERE key = ?
-            ORDER BY version DESC
-            LIMIT 1
-            """,
-            (key,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT key, version, state_json, state_hash, created_at
+                FROM state_snapshots
+                WHERE key = ?
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                (key,),
+            ).fetchone()
         if row is None:
             return None
         return StateSnapshot(
@@ -104,12 +111,21 @@ class SQLiteStateStore:
                 ).fetchone()
                 current_version = int(row[0]) if row else 0
                 current_hash = row[1] if row else None
-                if expected_hash is not None and current_hash != expected_hash:
+
+                if expected_hash == NO_SNAPSHOT_PRECONDITION:
+                    if row is not None:
+                        raise StateConflict(
+                            "state key {} was expected to have no snapshot, got version {}".format(
+                                key, current_version
+                            )
+                        )
+                elif expected_hash is not None and current_hash != expected_hash:
                     raise StateConflict(
                         "state hash mismatch for {}: expected {}, got {}".format(
                             key, expected_hash, current_hash
                         )
                     )
+
                 new_version = current_version + 1
                 self._conn.execute(
                     """
@@ -132,27 +148,35 @@ class SQLiteStateStore:
         )
 
     def revoke_lease(self, lease_id: str, reason: str = "revoked") -> None:
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO lease_revocations(lease_id, revoked_at, reason)
-                VALUES (?, ?, ?)
-                ON CONFLICT(lease_id) DO UPDATE SET
-                    revoked_at = excluded.revoked_at,
-                    reason = excluded.reason
-                """,
-                (lease_id, int(time.time()), reason),
-            )
+        # Revocations share the same connection and therefore the same lock as
+        # state commits. This makes the Human STOP path transaction-safe.
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO lease_revocations(lease_id, revoked_at, reason)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(lease_id) DO UPDATE SET
+                        revoked_at = excluded.revoked_at,
+                        reason = excluded.reason
+                    """,
+                    (lease_id, int(time.time()), reason),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def is_revoked(self, lease_id: str) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM lease_revocations WHERE lease_id = ? LIMIT 1",
-            (lease_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM lease_revocations WHERE lease_id = ? LIMIT 1",
+                (lease_id,),
+            ).fetchone()
         return row is not None
 
     def revoked_ids(self) -> Set[str]:
-        return {
-            row[0]
-            for row in self._conn.execute("SELECT lease_id FROM lease_revocations").fetchall()
-        }
+        with self._lock:
+            rows = self._conn.execute("SELECT lease_id FROM lease_revocations").fetchall()
+        return {row[0] for row in rows}
