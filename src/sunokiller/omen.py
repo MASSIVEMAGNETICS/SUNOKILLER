@@ -2,8 +2,8 @@
 
 The mastering stage is independent from neural synthesis and stem-separation
 workers. A verified stem-separation worker can feed OMEN through the same
-capability boundary; this harness already produces 48 kHz commercial masters
-from a mix or pre-rendered stem mix.
+capability boundary; this harness produces 48 kHz commercial masters from a
+mix or pre-rendered stem mix.
 """
 
 from __future__ import annotations
@@ -21,11 +21,22 @@ class OmenError(RuntimeError):
     pass
 
 
+MASTER_SAMPLE_RATE = 48000
+
 _FORMAT_CODECS = {
     ".wav": ["-c:a", "pcm_s24le"],
     ".flac": ["-c:a", "flac"],
     ".mp3": ["-c:a", "libmp3lame", "-b:a", "320k"],
 }
+
+
+def _require_master_sample_rate(sample_rate: int) -> None:
+    if int(sample_rate) != MASTER_SAMPLE_RATE:
+        raise OmenError(
+            "OMEN mastering contract requires {} Hz, got {}".format(
+                MASTER_SAMPLE_RATE, sample_rate
+            )
+        )
 
 
 def build_master_command(
@@ -35,8 +46,9 @@ def build_master_command(
     target_lufs: float = -14.0,
     true_peak: float = -1.0,
     loudness_range: float = 11.0,
-    sample_rate: int = 48000,
+    sample_rate: int = MASTER_SAMPLE_RATE,
 ) -> List[str]:
+    _require_master_sample_rate(sample_rate)
     out = Path(output_path)
     codec = _FORMAT_CODECS.get(out.suffix.lower())
     if codec is None:
@@ -50,7 +62,7 @@ def build_master_command(
         "-i",
         str(input_path),
         "-ar",
-        str(sample_rate),
+        str(MASTER_SAMPLE_RATE),
         "-af",
         "loudnorm=I={}:TP={}:LRA={}".format(
             target_lufs, true_peak, loudness_range
@@ -75,10 +87,11 @@ def master_file(
     target_lufs: float = -14.0,
     true_peak: float = -1.0,
     loudness_range: float = 11.0,
-    sample_rate: int = 48000,
+    sample_rate: int = MASTER_SAMPLE_RATE,
     timeout_seconds: int = 900,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
+    _require_master_sample_rate(sample_rate)
     source = Path(input_path).expanduser().resolve()
     target = Path(output_path).expanduser().resolve()
 
@@ -92,7 +105,7 @@ def master_file(
         target_lufs=target_lufs,
         true_peak=true_peak,
         loudness_range=loudness_range,
-        sample_rate=sample_rate,
+        sample_rate=MASTER_SAMPLE_RATE,
     )
 
     if dry_run:
@@ -101,6 +114,7 @@ def master_file(
             "command": cmd,
             "input": str(source),
             "output": str(target),
+            "sample_rate": MASTER_SAMPLE_RATE,
         }
 
     if shutil.which("ffmpeg") is None:
@@ -114,7 +128,7 @@ def master_file(
         "status": "MASTERED",
         "input": str(source),
         "output": str(target),
-        "sample_rate": sample_rate,
+        "sample_rate": MASTER_SAMPLE_RATE,
         "target_lufs": target_lufs,
         "true_peak": true_peak,
         "loudness_range": loudness_range,
@@ -131,7 +145,7 @@ def mastering_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
         target_lufs=float(payload.get("target_lufs", -14.0)),
         true_peak=float(payload.get("true_peak", -1.0)),
         loudness_range=float(payload.get("loudness_range", 11.0)),
-        sample_rate=int(payload.get("sample_rate", 48000)),
+        sample_rate=int(payload.get("sample_rate", MASTER_SAMPLE_RATE)),
         timeout_seconds=int(payload.get("timeout_seconds", 900)),
         dry_run=bool(payload.get("dry_run", False)),
     )
@@ -144,7 +158,7 @@ def main() -> None:
     parser.add_argument("--target-lufs", type=float, default=-14.0)
     parser.add_argument("--true-peak", type=float, default=-1.0)
     parser.add_argument("--lra", type=float, default=11.0)
-    parser.add_argument("--sample-rate", type=int, default=48000)
+    parser.add_argument("--sample-rate", type=int, choices=[MASTER_SAMPLE_RATE], default=MASTER_SAMPLE_RATE)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
