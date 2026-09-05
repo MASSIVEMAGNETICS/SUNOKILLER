@@ -5,32 +5,41 @@ This branch implements the first clean, bounded execution slice for the Victor D
 ## Invariants implemented
 
 1. **Identity/state external to workers** — canonical runtime state is stored in SQLite WAL snapshots, not model weights or worker memory.
-2. **Signed capability leases** — a worker must present a signed lease binding issuer, subject, capabilities, resource scope, validity window, nonce, and metadata.
-3. **Revocation / Human STOP path** — lease IDs can be revoked in the external state store and are checked before execution.
-4. **Process isolation** — work runs in a separate Python interpreter with a minimized environment and optional POSIX memory/CPU limits.
-5. **Transactional state commit** — workers may only propose `_state`; the parent process writes it with an optimistic pre-state hash check.
-6. **Signed execution receipts** — successful executions produce a signed receipt containing worker identity, capability/resource, input/output hashes, and pre/post state hashes.
-7. **Fail closed** — expired, revoked, unsigned/tampered, wrong-capability, and out-of-scope leases are rejected before worker execution.
+2. **Signed capability leases** — a worker must present a signed lease binding issuer, exact worker subject, capabilities, resource scope, validity window, nonce, and metadata.
+3. **Trusted worker policy registry** — callers select only a registered `module:function` target and bounded execution limits. Capability, logical resource, and required filesystem fields come from the trusted runtime registry, not caller-controlled labels.
+4. **Revocation / Human STOP path** — lease revocation uses the same locked SQLite transaction boundary as state persistence; a revoked lease cannot commit canonical state after a long-running worker returns.
+5. **Process isolation** — work runs in a separate Python interpreter with a minimized environment and optional POSIX memory/CPU limits.
+6. **Transactional state commit** — workers may only propose `_state`; the parent process writes it with optimistic pre-state hashing, including an explicit no-snapshot first-writer precondition.
+7. **Typed resource enforcement** — logical namespace scopes and filesystem scopes use separate matching rules. Filesystem access requires absolute resolved paths and real descendant containment; logical `:` namespace syntax is never used for path authorization.
+8. **Signed execution receipts** — successful executions produce a signed receipt containing the trusted worker identity, capability/resource, input/output hashes, and pre/post state hashes.
+9. **Fail closed** — expired, revoked, unsigned/tampered, wrong-capability, out-of-scope, unregistered-worker, worker-substitution, and filesystem-escape attempts are rejected.
 
 ## Acceptance matrix
 
 | Case | Expected result |
 |---|---|
-| Valid signed lease + allowed capability/resource | Worker runs |
+| Valid signed lease + registered worker + allowed resources | Worker runs |
 | Wrong capability | Reject |
-| Out-of-scope resource | Reject |
+| Out-of-scope logical resource | Reject |
+| Out-of-scope filesystem path | Reject |
+| Colon-sibling filesystem escape | Reject |
+| Unregistered worker | Reject |
+| Signed lease subject / worker mismatch | Reject |
 | Expired lease | Reject |
 | Revoked lease / Human STOP | Reject |
+| Human STOP during child execution | Reject result; no canonical state commit |
 | Tampered lease | Reject |
-| State precondition mismatch | Reject state commit |
+| Concurrent first-writer / state precondition mismatch | Reject stale state commit |
 | Tampered receipt | Reject receipt verification |
-| OMEN master command | 48 kHz + EBU R128 `loudnorm` contract |
+| Duplicate same-input executions | Unique receipt IDs |
+| OMEN master command | Hard 48 kHz + EBU R128 `loudnorm` contract |
+| OMEN 44.1 kHz override | Reject |
 
-`tests/test_sovereign_runtime.py` exercises these paths.
+`tests/test_sovereign_runtime.py` exercises these paths. A reconstructed current-head execution pass completed 19/19 security/contract checks before final independent review.
 
 ## OMEN mastering worker
 
-`omen` is exposed as a CLI and as `sunokiller.omen:mastering_worker` for capability-leased execution.
+`omen` is exposed as a CLI and as the trusted worker `sunokiller.omen:mastering_worker` for capability-leased execution. The runtime policy requires both `input_path` and `output_path` to fall under signed absolute filesystem scopes.
 
 Example:
 
@@ -43,6 +52,7 @@ The first harness uses FFmpeg's EBU R128 `loudnorm` filter, forces 48 kHz, and e
 ## Deliberate boundaries / not yet claimed
 
 - **HMAC-SHA256 is the v0.1 signing mechanism.** It provides a real signed contract with a secret held outside repository state, but it is symmetric. The contract is designed so Ed25519 can replace it later.
+- **The trusted worker registry is static in v0.1.** A signed manifest registry with code/package digests is the intended hardening path for dynamic workers.
 - **Process isolation is not a full container/seccomp sandbox.** POSIX CPU/memory limits are applied where supported. Stronger OS sandboxing is a follow-on hardening step.
 - **Stem separation is not reimplemented here.** Existing GAWDCORE/stem-separation source must be verified and then registered as a separate leased worker. OMEN can master a mix or a pre-rendered stem mix now.
 - **The Gemini continuity harness is complementary evidence, not the security gate.** Model-swap state-delta semantics can be integrated after this capability boundary passes independent review.
