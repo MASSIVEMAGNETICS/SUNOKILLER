@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Any, Dict, Mapping, Optional, Set
 
-from .contracts import canonical_json, digest_json
+from .contracts import LeaseRevoked, canonical_json, digest_json
 
 
 class StateConflict(RuntimeError):
@@ -84,13 +84,34 @@ class SQLiteStateStore:
             created_at=int(row[4]),
         )
 
+    def _lease_is_revoked_locked(self, lease_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM lease_revocations WHERE lease_id = ? LIMIT 1",
+            (lease_id,),
+        ).fetchone()
+        return row is not None
+
+    def assert_lease_active(self, lease_id: str) -> None:
+        """Fail if Human STOP/revocation is already durable at this instant."""
+        with self._lock:
+            if self._lease_is_revoked_locked(lease_id):
+                raise LeaseRevoked("lease has been revoked")
+
     def save_snapshot(
         self,
         key: str,
         state: Mapping[str, Any],
         *,
         expected_hash: Optional[str] = None,
+        lease_id: Optional[str] = None,
     ) -> StateSnapshot:
+        """Commit a state snapshot with optimistic concurrency and optional lease gate.
+
+        When lease_id is supplied, Human STOP/revocation is checked inside the
+        same BEGIN IMMEDIATE transaction that validates the state precondition
+        and inserts the next version. A revocation that commits before this
+        transaction therefore prevents canonical state mutation.
+        """
         payload = dict(state)
         state_json = canonical_json(payload)
         state_hash = digest_json(payload)
@@ -99,6 +120,9 @@ class SQLiteStateStore:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if lease_id is not None and self._lease_is_revoked_locked(lease_id):
+                    raise LeaseRevoked("lease revoked before canonical state commit")
+
                 row = self._conn.execute(
                     """
                     SELECT version, state_hash
@@ -170,11 +194,7 @@ class SQLiteStateStore:
 
     def is_revoked(self, lease_id: str) -> bool:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT 1 FROM lease_revocations WHERE lease_id = ? LIMIT 1",
-                (lease_id,),
-            ).fetchone()
-        return row is not None
+            return self._lease_is_revoked_locked(lease_id)
 
     def revoked_ids(self) -> Set[str]:
         with self._lock:
