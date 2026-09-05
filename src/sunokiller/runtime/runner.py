@@ -26,11 +26,15 @@ class WorkerTimeout(WorkerExecutionError):
 
 @dataclass(frozen=True)
 class WorkerSpec:
+    """Execution limits and exact import target.
+
+    Security-sensitive capability/resource policy is deliberately NOT supplied
+    here. A caller may request a registered worker and tune bounded execution
+    limits, but cannot declare what that worker is authorized to do.
+    """
+
     module: str
     function: str
-    capability: str
-    resource: str
-    payload_resource_fields: Tuple[str, ...] = ()
     timeout_seconds: float = 30.0
     max_memory_mb: Optional[int] = 1024
     max_cpu_seconds: Optional[int] = 30
@@ -38,6 +42,33 @@ class WorkerSpec:
     @property
     def worker_id(self) -> str:
         return "{}:{}".format(self.module, self.function)
+
+
+@dataclass(frozen=True)
+class WorkerPolicy:
+    worker_id: str
+    capability: str
+    logical_resource: str
+    filesystem_fields: Tuple[str, ...] = ()
+
+
+# This registry is part of the trusted runtime boundary. Callers cannot weaken
+# a worker policy by constructing WorkerSpec differently. New workers must be
+# intentionally registered here (or, in a later version, through a signed
+# manifest registry with equivalent trust semantics).
+_TRUSTED_WORKER_POLICIES = {
+    "sunokiller.runtime.demo_worker:update_counter": WorkerPolicy(
+        worker_id="sunokiller.runtime.demo_worker:update_counter",
+        capability="audio.master",
+        logical_resource="catalog/masters/demo",
+    ),
+    "sunokiller.omen:mastering_worker": WorkerPolicy(
+        worker_id="sunokiller.omen:mastering_worker",
+        capability="audio.master",
+        logical_resource="catalog/masters/omen",
+        filesystem_fields=("input_path", "output_path"),
+    ),
+}
 
 
 def _minimal_environment() -> Dict[str, str]:
@@ -78,17 +109,18 @@ def _resource_limiter(
 
 
 class IsolatedRunner:
-    """Run an authorized worker in a separate interpreter process.
+    """Run a registered, capability-leased worker in a separate interpreter.
 
     The child receives only the JSON job payload and a minimized environment.
     It cannot write canonical state directly; it may only propose `_state`,
     which the parent commits transactionally after successful execution.
 
     Security contract:
-    - the signed lease subject must equal the exact module:function worker_id;
-    - the worker's logical resource must be in scope;
-    - any declared payload resource fields are resolved to real filesystem paths
-      and independently checked against the signed lease scopes;
+    - exact worker code target must exist in the trusted worker-policy registry;
+    - the signed lease subject must equal that exact module:function worker_id;
+    - capability/logical-resource policy comes only from the trusted registry;
+    - required filesystem fields come only from the trusted registry and use
+      filesystem-aware path containment, never logical ':' namespace matching;
     - lease validity is rechecked after the subprocess returns;
     - Human STOP/revocation is checked atomically with canonical state commit.
     """
@@ -104,29 +136,40 @@ class IsolatedRunner:
         self.state_store = state_store
         self.state_key = state_key
 
+    @staticmethod
+    def _policy_for(worker: WorkerSpec) -> WorkerPolicy:
+        policy = _TRUSTED_WORKER_POLICIES.get(worker.worker_id)
+        if policy is None:
+            raise WorkerExecutionError(
+                "worker is not registered in trusted policy: {}".format(worker.worker_id)
+            )
+        return policy
+
     def _verify_worker_and_resources(
         self,
         *,
         lease: CapabilityLease,
         worker: WorkerSpec,
         payload: Mapping[str, Any],
-    ) -> None:
-        if lease.subject != worker.worker_id:
+    ) -> WorkerPolicy:
+        policy = self._policy_for(worker)
+        if lease.subject != policy.worker_id:
             raise WorkerExecutionError(
                 "signed lease subject {} does not authorize worker {}".format(
-                    lease.subject, worker.worker_id
+                    lease.subject, policy.worker_id
                 )
             )
 
         revoked_ids = self.state_store.revoked_ids()
         self.authority.verify_lease(
             lease,
-            required_capability=worker.capability,
-            resource=worker.resource,
+            required_capability=policy.capability,
+            resource=policy.logical_resource,
             revoked_ids=revoked_ids,
+            resource_kind="logical",
         )
 
-        for field in worker.payload_resource_fields:
+        for field in policy.filesystem_fields:
             raw_value = payload.get(field)
             if not isinstance(raw_value, str) or not raw_value:
                 raise WorkerExecutionError(
@@ -135,10 +178,12 @@ class IsolatedRunner:
             actual_resource = str(Path(raw_value).expanduser().resolve())
             self.authority.verify_lease(
                 lease,
-                required_capability=worker.capability,
+                required_capability=policy.capability,
                 resource=actual_resource,
                 revoked_ids=revoked_ids,
+                resource_kind="filesystem",
             )
+        return policy
 
     def execute(
         self,
@@ -148,7 +193,7 @@ class IsolatedRunner:
         payload: Mapping[str, Any],
     ) -> Tuple[Dict[str, Any], ExecutionReceipt]:
         input_payload = dict(payload)
-        self._verify_worker_and_resources(
+        policy = self._verify_worker_and_resources(
             lease=lease,
             worker=worker,
             payload=input_payload,
@@ -195,9 +240,9 @@ class IsolatedRunner:
             raise WorkerExecutionError(message.get("error", "unknown worker error"))
 
         # A long-running worker may cross lease expiry or be revoked while the
-        # subprocess is running. Revalidate all signed authority immediately
-        # before accepting its result.
-        self._verify_worker_and_resources(
+        # subprocess is running. Revalidate signed authority immediately before
+        # accepting its result. Re-read trusted policy as part of that check.
+        policy = self._verify_worker_and_resources(
             lease=lease,
             worker=worker,
             payload=input_payload,
@@ -225,9 +270,9 @@ class IsolatedRunner:
         receipt = ExecutionReceipt(
             execution_id="EXEC-" + uuid.uuid4().hex,
             lease_id=lease.lease_id,
-            worker=worker.worker_id,
-            capability=worker.capability,
-            resource=worker.resource,
+            worker=policy.worker_id,
+            capability=policy.capability,
+            resource=policy.logical_resource,
             started_at=started,
             finished_at=finished,
             pre_state_hash=pre_hash,
