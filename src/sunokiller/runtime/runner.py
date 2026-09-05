@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -29,6 +30,7 @@ class WorkerSpec:
     function: str
     capability: str
     resource: str
+    payload_resource_fields: Tuple[str, ...] = ()
     timeout_seconds: float = 30.0
     max_memory_mb: Optional[int] = 1024
     max_cpu_seconds: Optional[int] = 30
@@ -81,6 +83,14 @@ class IsolatedRunner:
     The child receives only the JSON job payload and a minimized environment.
     It cannot write canonical state directly; it may only propose `_state`,
     which the parent commits transactionally after successful execution.
+
+    Security contract:
+    - the signed lease subject must equal the exact module:function worker_id;
+    - the worker's logical resource must be in scope;
+    - any declared payload resource fields are resolved to real filesystem paths
+      and independently checked against the signed lease scopes;
+    - lease validity is rechecked after the subprocess returns;
+    - Human STOP/revocation is checked atomically with canonical state commit.
     """
 
     def __init__(
@@ -94,6 +104,42 @@ class IsolatedRunner:
         self.state_store = state_store
         self.state_key = state_key
 
+    def _verify_worker_and_resources(
+        self,
+        *,
+        lease: CapabilityLease,
+        worker: WorkerSpec,
+        payload: Mapping[str, Any],
+    ) -> None:
+        if lease.subject != worker.worker_id:
+            raise WorkerExecutionError(
+                "signed lease subject {} does not authorize worker {}".format(
+                    lease.subject, worker.worker_id
+                )
+            )
+
+        revoked_ids = self.state_store.revoked_ids()
+        self.authority.verify_lease(
+            lease,
+            required_capability=worker.capability,
+            resource=worker.resource,
+            revoked_ids=revoked_ids,
+        )
+
+        for field in worker.payload_resource_fields:
+            raw_value = payload.get(field)
+            if not isinstance(raw_value, str) or not raw_value:
+                raise WorkerExecutionError(
+                    "payload resource field {} must be a non-empty path string".format(field)
+                )
+            actual_resource = str(Path(raw_value).expanduser().resolve())
+            self.authority.verify_lease(
+                lease,
+                required_capability=worker.capability,
+                resource=actual_resource,
+                revoked_ids=revoked_ids,
+            )
+
     def execute(
         self,
         *,
@@ -101,17 +147,16 @@ class IsolatedRunner:
         worker: WorkerSpec,
         payload: Mapping[str, Any],
     ) -> Tuple[Dict[str, Any], ExecutionReceipt]:
-        self.authority.verify_lease(
-            lease,
-            required_capability=worker.capability,
-            resource=worker.resource,
-            revoked_ids=self.state_store.revoked_ids(),
+        input_payload = dict(payload)
+        self._verify_worker_and_resources(
+            lease=lease,
+            worker=worker,
+            payload=input_payload,
         )
 
         pre = self.state_store.load_latest(self.state_key)
         pre_hash = pre.state_hash if pre else digest_json({})
         started = int(time.time())
-        input_payload = dict(payload)
         input_hash = digest_json(input_payload)
 
         envelope = {
@@ -149,6 +194,15 @@ class IsolatedRunner:
         if not message.get("ok"):
             raise WorkerExecutionError(message.get("error", "unknown worker error"))
 
+        # A long-running worker may cross lease expiry or be revoked while the
+        # subprocess is running. Revalidate all signed authority immediately
+        # before accepting its result.
+        self._verify_worker_and_resources(
+            lease=lease,
+            worker=worker,
+            payload=input_payload,
+        )
+
         result = dict(message["result"])
         proposed_state = result.pop("_state", None)
         post_hash = pre_hash
@@ -159,8 +213,13 @@ class IsolatedRunner:
                 self.state_key,
                 proposed_state,
                 expected_hash=pre.state_hash if pre else NO_SNAPSHOT_PRECONDITION,
+                lease_id=lease.lease_id,
             )
             post_hash = snapshot.state_hash
+        else:
+            # For stateless work, define the successful execution boundary as
+            # the final durable revocation check before receipt construction.
+            self.state_store.assert_lease_active(lease.lease_id)
 
         finished = int(time.time())
         receipt = ExecutionReceipt(
