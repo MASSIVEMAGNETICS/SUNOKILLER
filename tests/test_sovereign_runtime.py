@@ -45,8 +45,17 @@ class CapabilityBoundaryTests(unittest.TestCase):
         return WorkerSpec(
             module="sunokiller.runtime.demo_worker",
             function="update_counter",
-            capability="audio.master",
-            resource="catalog/masters/demo",
+            timeout_seconds=5,
+            max_memory_mb=None,
+            max_cpu_seconds=None,
+        )
+
+    def omen_worker(self):
+        # No caller-provided capability/resource/path policy exists here.
+        # Those requirements come from the trusted runtime registry.
+        return WorkerSpec(
+            module="sunokiller.omen",
+            function="mastering_worker",
             timeout_seconds=5,
             max_memory_mb=None,
             max_cpu_seconds=None,
@@ -165,20 +174,27 @@ class CapabilityBoundaryTests(unittest.TestCase):
 
     def test_signed_lease_is_bound_to_exact_worker_code(self):
         lease = self.issue()
-        substituted = WorkerSpec(
-            module="sunokiller.omen",
-            function="mastering_worker",
-            capability="audio.master",
-            resource="catalog/masters/demo",
-            max_memory_mb=None,
-            max_cpu_seconds=None,
-        )
         with self.assertRaises(WorkerExecutionError):
             self.runner().execute(
                 lease=lease,
-                worker=substituted,
+                worker=self.omen_worker(),
                 payload={"input_path": "x", "output_path": "y"},
             )
+
+    def test_unregistered_worker_is_rejected_before_execution(self):
+        worker = WorkerSpec(
+            module="os.path",
+            function="exists",
+            max_memory_mb=None,
+            max_cpu_seconds=None,
+        )
+        lease = self.authority.issue_lease(
+            subject=worker.worker_id,
+            capabilities=["audio.master"],
+            resource_scopes=["*"],
+        )
+        with self.assertRaises(WorkerExecutionError):
+            self.runner().execute(lease=lease, worker=worker, payload={})
 
     def test_human_stop_during_worker_blocks_canonical_commit(self):
         runner = self.runner()
@@ -237,18 +253,9 @@ class CapabilityBoundaryTests(unittest.TestCase):
         self.authority.verify_receipt(first)
         self.authority.verify_receipt(second)
 
-    def test_omen_payload_paths_must_be_in_signed_scope(self):
+    def test_omen_paths_are_enforced_by_trusted_policy_without_caller_fields(self):
         runner = self.runner()
-        omen_worker = WorkerSpec(
-            module="sunokiller.omen",
-            function="mastering_worker",
-            capability="audio.master",
-            resource="catalog/masters/omen",
-            payload_resource_fields=("input_path", "output_path"),
-            timeout_seconds=5,
-            max_memory_mb=None,
-            max_cpu_seconds=None,
-        )
+        omen_worker = self.omen_worker()
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as forbidden:
             source = Path(allowed) / "in.wav"
             source.write_bytes(b"placeholder")
@@ -269,18 +276,37 @@ class CapabilityBoundaryTests(unittest.TestCase):
                     },
                 )
 
+    def test_filesystem_colon_sibling_does_not_escape_scope(self):
+        runner = self.runner()
+        omen_worker = self.omen_worker()
+        with tempfile.TemporaryDirectory() as parent:
+            parent_path = Path(parent)
+            allowed = parent_path / "allowed"
+            sibling = parent_path / "allowed:outside"
+            allowed.mkdir()
+            sibling.mkdir()
+            source = allowed / "in.wav"
+            source.write_bytes(b"placeholder")
+            forbidden_output = sibling / "out.wav"
+            lease = self.authority.issue_lease(
+                subject=omen_worker.worker_id,
+                capabilities=["audio.master"],
+                resource_scopes=["catalog/masters", str(allowed.resolve())],
+            )
+            with self.assertRaises(ResourceDenied):
+                runner.execute(
+                    lease=lease,
+                    worker=omen_worker,
+                    payload={
+                        "input_path": str(source),
+                        "output_path": str(forbidden_output),
+                        "dry_run": True,
+                    },
+                )
+
     def test_omen_dry_run_succeeds_when_actual_paths_are_in_scope(self):
         runner = self.runner()
-        omen_worker = WorkerSpec(
-            module="sunokiller.omen",
-            function="mastering_worker",
-            capability="audio.master",
-            resource="catalog/masters/omen",
-            payload_resource_fields=("input_path", "output_path"),
-            timeout_seconds=5,
-            max_memory_mb=None,
-            max_cpu_seconds=None,
-        )
+        omen_worker = self.omen_worker()
         with tempfile.TemporaryDirectory() as allowed:
             root = Path(allowed).resolve()
             source = root / "in.wav"
