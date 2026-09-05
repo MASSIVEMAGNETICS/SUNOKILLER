@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 import hmac
 import json
+from pathlib import Path
 import secrets
 import time
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
@@ -52,7 +53,8 @@ def digest_bytes(value: bytes) -> str:
     return sha256(value).hexdigest()
 
 
-def _scope_match(resource: str, allowed_scope: str) -> bool:
+def _logical_scope_match(resource: str, allowed_scope: str) -> bool:
+    """Match logical resource namespaces such as catalog/masters or audio:master."""
     if allowed_scope == "*":
         return True
     if resource == allowed_scope:
@@ -61,6 +63,30 @@ def _scope_match(resource: str, allowed_scope: str) -> bool:
         resource.startswith(allowed_scope.rstrip("/") + "/")
         or resource.startswith(allowed_scope.rstrip(":") + ":")
     )
+
+
+def _filesystem_scope_match(resource: str, allowed_scope: str) -> bool:
+    """Filesystem-aware containment; never interpret ':' as a path hierarchy.
+
+    Filesystem scopes must be absolute paths (or '*'). Both resource and scope
+    are resolved before containment. This prevents a sibling such as
+    `/srv/allowed:outside/file.wav` from matching `/srv/allowed`.
+    """
+    if allowed_scope == "*":
+        return True
+
+    scope_path = Path(allowed_scope).expanduser()
+    resource_path = Path(resource).expanduser()
+    if not scope_path.is_absolute() or not resource_path.is_absolute():
+        return False
+
+    scope_path = scope_path.resolve()
+    resource_path = resource_path.resolve()
+    try:
+        resource_path.relative_to(scope_path)
+        return True
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -175,6 +201,7 @@ class HMACAuthority:
         resource: str,
         now: Optional[int] = None,
         revoked_ids: Iterable[str] = (),
+        resource_kind: str = "logical",
     ) -> None:
         expected = self._sign_payload(lease.unsigned_payload())
         if not hmac.compare_digest(expected, lease.signature):
@@ -191,7 +218,15 @@ class HMACAuthority:
             raise LeaseRevoked("lease has been revoked")
         if required_capability not in lease.capabilities:
             raise CapabilityDenied(required_capability)
-        if not any(_scope_match(resource, scope) for scope in lease.resource_scopes):
+
+        if resource_kind == "logical":
+            matcher = _logical_scope_match
+        elif resource_kind == "filesystem":
+            matcher = _filesystem_scope_match
+        else:
+            raise ValueError("unsupported resource_kind: {}".format(resource_kind))
+
+        if not any(matcher(resource, scope) for scope in lease.resource_scopes):
             raise ResourceDenied(resource)
 
     def sign_receipt(self, receipt: ExecutionReceipt) -> ExecutionReceipt:
