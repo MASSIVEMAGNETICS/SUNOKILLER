@@ -1,5 +1,6 @@
 import dataclasses
 import os
+from pathlib import Path
 import tempfile
 import threading
 import time
@@ -13,8 +14,9 @@ from sunokiller.runtime.contracts import (
     LeaseRevoked,
     ResourceDenied,
 )
+from sunokiller.runtime.runner import WorkerExecutionError
 from sunokiller.runtime.state import NO_SNAPSHOT_PRECONDITION, StateConflict
-from sunokiller.omen import build_master_command
+from sunokiller.omen import OmenError, build_master_command
 
 
 class CapabilityBoundaryTests(unittest.TestCase):
@@ -32,14 +34,6 @@ class CapabilityBoundaryTests(unittest.TestCase):
         except OSError:
             pass
 
-    def issue(self, ttl=300):
-        return self.authority.issue_lease(
-            subject="victor-daw-master-worker",
-            capabilities=["audio.master"],
-            resource_scopes=["catalog/masters"],
-            ttl_seconds=ttl,
-        )
-
     def runner(self):
         return IsolatedRunner(
             authority=self.authority,
@@ -56,6 +50,14 @@ class CapabilityBoundaryTests(unittest.TestCase):
             timeout_seconds=5,
             max_memory_mb=None,
             max_cpu_seconds=None,
+        )
+
+    def issue(self, ttl=300):
+        return self.authority.issue_lease(
+            subject=self.demo_worker().worker_id,
+            capabilities=["audio.master"],
+            resource_scopes=["catalog/masters"],
+            ttl_seconds=ttl,
         )
 
     def test_authorized_lease(self):
@@ -87,7 +89,7 @@ class CapabilityBoundaryTests(unittest.TestCase):
     def test_expired_lease_rejected(self):
         now = int(time.time())
         lease = self.authority.issue_lease(
-            subject="worker",
+            subject=self.demo_worker().worker_id,
             capabilities=["audio.master"],
             resource_scopes=["catalog"],
             ttl_seconds=1,
@@ -161,13 +163,52 @@ class CapabilityBoundaryTests(unittest.TestCase):
         self.assertTrue(finished.is_set())
         self.assertTrue(self.store.is_revoked(lease.lease_id))
 
+    def test_signed_lease_is_bound_to_exact_worker_code(self):
+        lease = self.issue()
+        substituted = WorkerSpec(
+            module="sunokiller.omen",
+            function="mastering_worker",
+            capability="audio.master",
+            resource="catalog/masters/demo",
+            max_memory_mb=None,
+            max_cpu_seconds=None,
+        )
+        with self.assertRaises(WorkerExecutionError):
+            self.runner().execute(
+                lease=lease,
+                worker=substituted,
+                payload={"input_path": "x", "output_path": "y"},
+            )
+
+    def test_human_stop_during_worker_blocks_canonical_commit(self):
+        runner = self.runner()
+        lease = self.issue()
+        failures = []
+
+        def execute_slow_worker():
+            try:
+                runner.execute(
+                    lease=lease,
+                    worker=self.demo_worker(),
+                    payload={"value": 4, "sleep_seconds": 0.5},
+                )
+            except Exception as exc:
+                failures.append(exc)
+
+        thread = threading.Thread(target=execute_slow_worker)
+        thread.start()
+        time.sleep(0.15)
+        self.store.revoke_lease(lease.lease_id, "human stop during execution")
+        thread.join(timeout=2.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(failures)
+        self.assertIsInstance(failures[0], LeaseRevoked)
+        self.assertIsNone(self.store.load_latest("runtime"))
+
     def test_receipt_tampering_rejected(self):
         runner = self.runner()
-        lease = self.authority.issue_lease(
-            subject="demo",
-            capabilities=["audio.master"],
-            resource_scopes=["catalog/masters"],
-        )
+        lease = self.issue()
         result, receipt = runner.execute(
             lease=lease,
             worker=self.demo_worker(),
@@ -181,11 +222,7 @@ class CapabilityBoundaryTests(unittest.TestCase):
 
     def test_execution_ids_unique_for_identical_invocations(self):
         runner = self.runner()
-        lease = self.authority.issue_lease(
-            subject="demo",
-            capabilities=["audio.master"],
-            resource_scopes=["catalog/masters"],
-        )
+        lease = self.issue()
         _, first = runner.execute(
             lease=lease,
             worker=self.demo_worker(),
@@ -200,6 +237,73 @@ class CapabilityBoundaryTests(unittest.TestCase):
         self.authority.verify_receipt(first)
         self.authority.verify_receipt(second)
 
+    def test_omen_payload_paths_must_be_in_signed_scope(self):
+        runner = self.runner()
+        omen_worker = WorkerSpec(
+            module="sunokiller.omen",
+            function="mastering_worker",
+            capability="audio.master",
+            resource="catalog/masters/omen",
+            payload_resource_fields=("input_path", "output_path"),
+            timeout_seconds=5,
+            max_memory_mb=None,
+            max_cpu_seconds=None,
+        )
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as forbidden:
+            source = Path(allowed) / "in.wav"
+            source.write_bytes(b"placeholder")
+            forbidden_output = Path(forbidden) / "out.wav"
+            lease = self.authority.issue_lease(
+                subject=omen_worker.worker_id,
+                capabilities=["audio.master"],
+                resource_scopes=["catalog/masters", str(Path(allowed).resolve())],
+            )
+            with self.assertRaises(ResourceDenied):
+                runner.execute(
+                    lease=lease,
+                    worker=omen_worker,
+                    payload={
+                        "input_path": str(source),
+                        "output_path": str(forbidden_output),
+                        "dry_run": True,
+                    },
+                )
+
+    def test_omen_dry_run_succeeds_when_actual_paths_are_in_scope(self):
+        runner = self.runner()
+        omen_worker = WorkerSpec(
+            module="sunokiller.omen",
+            function="mastering_worker",
+            capability="audio.master",
+            resource="catalog/masters/omen",
+            payload_resource_fields=("input_path", "output_path"),
+            timeout_seconds=5,
+            max_memory_mb=None,
+            max_cpu_seconds=None,
+        )
+        with tempfile.TemporaryDirectory() as allowed:
+            root = Path(allowed).resolve()
+            source = root / "in.wav"
+            output = root / "out.wav"
+            source.write_bytes(b"placeholder")
+            lease = self.authority.issue_lease(
+                subject=omen_worker.worker_id,
+                capabilities=["audio.master"],
+                resource_scopes=["catalog/masters", str(root)],
+            )
+            result, receipt = runner.execute(
+                lease=lease,
+                worker=omen_worker,
+                payload={
+                    "input_path": str(source),
+                    "output_path": str(output),
+                    "dry_run": True,
+                },
+            )
+            self.assertEqual(result["status"], "DRY_RUN")
+            self.assertEqual(result["sample_rate"], 48000)
+            self.authority.verify_receipt(receipt)
+
 
 class OmenHarnessTests(unittest.TestCase):
     def test_command_enforces_48k_and_loudnorm(self):
@@ -213,6 +317,14 @@ class OmenHarnessTests(unittest.TestCase):
         self.assertIn("-ar 48000", rendered)
         self.assertIn("loudnorm=I=-14.0", rendered)
         self.assertIn("pcm_s24le", rendered)
+
+    def test_non_48k_override_is_rejected(self):
+        with self.assertRaises(OmenError):
+            build_master_command(
+                input_path="in.wav",
+                output_path="out.wav",
+                sample_rate=44100,
+            )
 
 
 if __name__ == "__main__":
