@@ -36,6 +36,7 @@ setup(
     entry_points={
         "console_scripts": [
             "sunokiller=sunokiller.cli:main",
+            "omen=sunokiller.omen:main",
         ],
     },
 )
