@@ -48,8 +48,8 @@ class CapabilityBoundaryTests(unittest.TestCase):
             module="sunokiller.runtime.demo_worker",
             function="update_counter",
             timeout_seconds=5,
-            max_memory_mb=None,
-            max_cpu_seconds=None,
+            max_memory_mb=512,
+            max_cpu_seconds=5,
         )
 
     def omen_worker(self, timeout_seconds=5):
@@ -59,8 +59,8 @@ class CapabilityBoundaryTests(unittest.TestCase):
             module="sunokiller.omen",
             function="mastering_worker",
             timeout_seconds=timeout_seconds,
-            max_memory_mb=None,
-            max_cpu_seconds=None,
+            max_memory_mb=512,
+            max_cpu_seconds=5,
         )
 
     def issue(self, ttl=300):
@@ -217,8 +217,6 @@ class CapabilityBoundaryTests(unittest.TestCase):
         worker = WorkerSpec(
             module="os.path",
             function="exists",
-            max_memory_mb=None,
-            max_cpu_seconds=None,
         )
         lease = self.authority.issue_lease(
             subject=worker.worker_id,
@@ -227,6 +225,59 @@ class CapabilityBoundaryTests(unittest.TestCase):
         )
         with self.assertRaises(WorkerExecutionError):
             self.runner().execute(lease=lease, worker=worker, payload={})
+
+    def test_caller_cannot_disable_or_raise_trusted_execution_limits(self):
+        lease = self.issue()
+        base = self.demo_worker()
+        invalid_workers = [
+            dataclasses.replace(base, timeout_seconds=None),
+            dataclasses.replace(base, timeout_seconds=31),
+            dataclasses.replace(base, max_memory_mb=None),
+            dataclasses.replace(base, max_memory_mb=1025),
+            dataclasses.replace(base, max_cpu_seconds=None),
+            dataclasses.replace(base, max_cpu_seconds=31),
+        ]
+        for worker in invalid_workers:
+            with self.subTest(worker=worker):
+                with self.assertRaises(WorkerExecutionError):
+                    self.runner().execute(lease=lease, worker=worker, payload={"value": 4})
+        self.assertIsNone(self.store.load_latest("runtime"))
+
+    def test_ambient_pythonpath_and_cwd_cannot_shadow_worker_entry(self):
+        runner = self.runner()
+        lease = self.issue()
+        with tempfile.TemporaryDirectory() as shadow:
+            root = Path(shadow)
+            package = root / "sunokiller" / "runtime"
+            package.mkdir(parents=True)
+            (root / "sunokiller" / "__init__.py").write_text("", encoding="utf-8")
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            marker = root / "shadow-worker-entry-ran.txt"
+            (package / "worker_entry.py").write_text(
+                "from pathlib import Path\nPath({!r}).write_text('owned')\n".format(str(marker)),
+                encoding="utf-8",
+            )
+
+            old_cwd = os.getcwd()
+            old_pythonpath = os.environ.get("PYTHONPATH")
+            os.chdir(root)
+            os.environ["PYTHONPATH"] = str(root)
+            try:
+                result, receipt = runner.execute(
+                    lease=lease,
+                    worker=self.demo_worker(),
+                    payload={"value": 4},
+                )
+            finally:
+                os.chdir(old_cwd)
+                if old_pythonpath is None:
+                    os.environ.pop("PYTHONPATH", None)
+                else:
+                    os.environ["PYTHONPATH"] = old_pythonpath
+
+            self.assertEqual(result["value"], 5)
+            self.assertFalse(marker.exists())
+            self.authority.verify_receipt(receipt)
 
     def test_human_stop_during_worker_blocks_canonical_commit(self):
         runner = self.runner()
