@@ -4,6 +4,7 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - "src/sunokiller/__init__.py"
       - "src/sunokiller/runtime/**"
       - "src/sunokiller/omen.py"
       - "tests/test_sovereign_runtime.py"
@@ -12,6 +13,7 @@ on:
   push:
     branches: [main]
     paths:
+      - "src/sunokiller/__init__.py"
       - "src/sunokiller/runtime/**"
       - "src/sunokiller/omen.py"
       - "tests/test_sovereign_runtime.py"
