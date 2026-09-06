@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Any, Dict, Mapping, Optional, Set
 
-from .contracts import LeaseRevoked, canonical_json, digest_json
+from .contracts import LeaseExpired, LeaseRevoked, canonical_json, digest_json
 
 
 class StateConflict(RuntimeError):
@@ -91,11 +91,22 @@ class SQLiteStateStore:
         ).fetchone()
         return row is not None
 
-    def assert_lease_active(self, lease_id: str) -> None:
-        """Fail if Human STOP/revocation is already durable at this instant."""
+    @staticmethod
+    def _assert_not_expired(expires_at: Optional[int]) -> None:
+        if expires_at is not None and int(time.time()) >= int(expires_at):
+            raise LeaseExpired("lease expired before commit boundary")
+
+    def assert_lease_active(
+        self,
+        lease_id: str,
+        *,
+        expires_at: Optional[int] = None,
+    ) -> None:
+        """Fail if revocation/expiry is already durable at this instant."""
         with self._lock:
             if self._lease_is_revoked_locked(lease_id):
                 raise LeaseRevoked("lease has been revoked")
+            self._assert_not_expired(expires_at)
 
     def save_snapshot(
         self,
@@ -104,24 +115,27 @@ class SQLiteStateStore:
         *,
         expected_hash: Optional[str] = None,
         lease_id: Optional[str] = None,
+        lease_expires_at: Optional[int] = None,
     ) -> StateSnapshot:
-        """Commit a state snapshot with optimistic concurrency and optional lease gate.
+        """Commit state with optimistic concurrency and an atomic lease gate.
 
-        When lease_id is supplied, Human STOP/revocation is checked inside the
-        same BEGIN IMMEDIATE transaction that validates the state precondition
-        and inserts the next version. A revocation that commits before this
-        transaction therefore prevents canonical state mutation.
+        When lease_id is supplied, Human STOP/revocation and lease expiry are
+        both checked *after* BEGIN IMMEDIATE acquires SQLite's write lock and
+        before the state precondition or insert is evaluated. A writer that was
+        valid before blocking cannot mutate canonical state after its lease
+        expires while waiting for the database.
         """
         payload = dict(state)
         state_json = canonical_json(payload)
         state_hash = digest_json(payload)
-        created_at = int(time.time())
 
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                if lease_id is not None and self._lease_is_revoked_locked(lease_id):
-                    raise LeaseRevoked("lease revoked before canonical state commit")
+                if lease_id is not None:
+                    if self._lease_is_revoked_locked(lease_id):
+                        raise LeaseRevoked("lease revoked before canonical state commit")
+                    self._assert_not_expired(lease_expires_at)
 
                 row = self._conn.execute(
                     """
@@ -151,6 +165,7 @@ class SQLiteStateStore:
                     )
 
                 new_version = current_version + 1
+                created_at = int(time.time())
                 self._conn.execute(
                     """
                     INSERT INTO state_snapshots(key, version, state_json, state_hash, created_at)
