@@ -453,6 +453,7 @@ class IsolatedRunner:
     - the worker never receives the original authorized filesystem paths;
     - lease validity is rechecked after the subprocess returns;
     - Human STOP/revocation and lease expiry are checked inside state commit;
+    - external output publication is linearized against STOP/revocation;
     - worker timeout terminates the entire descendant process tree/group.
     """
 
@@ -608,10 +609,23 @@ class IsolatedRunner:
 
             result = dict(message["result"])
             proposed_state = result.pop("_state", None)
+            output_commit_linearized = False
 
             # File-producing workers write only into the private staging area.
-            # Commit their outputs only after the post-execution authority check.
-            stager.commit_outputs()
+            # The actual publish step is short and runs while SQLite holds the
+            # lease commit guard, so a concurrent Human STOP either commits
+            # before publication (and blocks it) or after the authorized file
+            # replacement has fully completed.
+            if policy.filesystem_outputs and not input_payload.get("dry_run"):
+                with self.state_store.lease_commit_guard(
+                    lease.lease_id,
+                    expires_at=lease.expires_at,
+                ):
+                    stager.commit_outputs()
+                output_commit_linearized = True
+            else:
+                stager.commit_outputs()
+
             result = stager.restore_public_paths(result)
 
             post_hash = pre_hash
@@ -626,9 +640,9 @@ class IsolatedRunner:
                     lease_expires_at=lease.expires_at,
                 )
                 post_hash = snapshot.state_hash
-            else:
-                # For stateless work, define the successful execution boundary
-                # as the final durable revocation + expiry check before receipt.
+            elif not output_commit_linearized:
+                # Stateless/no-side-effect work still needs one final durable
+                # authority check before its successful receipt is issued.
                 self.state_store.assert_lease_active(
                     lease.lease_id,
                     expires_at=lease.expires_at,
