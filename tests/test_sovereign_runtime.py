@@ -1,6 +1,8 @@
 import dataclasses
 import os
 from pathlib import Path
+import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -14,7 +16,7 @@ from sunokiller.runtime.contracts import (
     LeaseRevoked,
     ResourceDenied,
 )
-from sunokiller.runtime.runner import WorkerExecutionError
+from sunokiller.runtime.runner import WorkerExecutionError, WorkerTimeout
 from sunokiller.runtime.state import NO_SNAPSHOT_PRECONDITION, StateConflict
 from sunokiller.omen import OmenError, build_master_command
 
@@ -50,13 +52,13 @@ class CapabilityBoundaryTests(unittest.TestCase):
             max_cpu_seconds=None,
         )
 
-    def omen_worker(self):
+    def omen_worker(self, timeout_seconds=5):
         # No caller-provided capability/resource/path policy exists here.
         # Those requirements come from the trusted runtime registry.
         return WorkerSpec(
             module="sunokiller.omen",
             function="mastering_worker",
-            timeout_seconds=5,
+            timeout_seconds=timeout_seconds,
             max_memory_mb=None,
             max_cpu_seconds=None,
         )
@@ -172,6 +174,36 @@ class CapabilityBoundaryTests(unittest.TestCase):
         self.assertTrue(finished.is_set())
         self.assertTrue(self.store.is_revoked(lease.lease_id))
 
+    def test_expiry_is_rechecked_after_sqlite_write_lock_is_acquired(self):
+        lease = self.issue(ttl=1)
+        blocker = sqlite3.connect(self.db_path, isolation_level=None)
+        blocker.execute("BEGIN IMMEDIATE")
+        failures = []
+
+        def write_after_wait():
+            try:
+                self.store.save_snapshot(
+                    "expiry-runtime",
+                    {"value": 1},
+                    expected_hash=NO_SNAPSHOT_PRECONDITION,
+                    lease_id=lease.lease_id,
+                    lease_expires_at=lease.expires_at,
+                )
+            except Exception as exc:
+                failures.append(exc)
+
+        thread = threading.Thread(target=write_after_wait)
+        thread.start()
+        time.sleep(1.2)
+        blocker.execute("COMMIT")
+        blocker.close()
+        thread.join(timeout=2.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(failures)
+        self.assertIsInstance(failures[0], LeaseExpired)
+        self.assertIsNone(self.store.load_latest("expiry-runtime"))
+
     def test_signed_lease_is_bound_to_exact_worker_code(self):
         lease = self.issue()
         with self.assertRaises(WorkerExecutionError):
@@ -253,6 +285,7 @@ class CapabilityBoundaryTests(unittest.TestCase):
         self.authority.verify_receipt(first)
         self.authority.verify_receipt(second)
 
+    @unittest.skipUnless(os.name == "posix", "descriptor-safe filesystem broker is POSIX v0.1")
     def test_omen_paths_are_enforced_by_trusted_policy_without_caller_fields(self):
         runner = self.runner()
         omen_worker = self.omen_worker()
@@ -276,6 +309,7 @@ class CapabilityBoundaryTests(unittest.TestCase):
                     },
                 )
 
+    @unittest.skipUnless(os.name == "posix", "descriptor-safe filesystem broker is POSIX v0.1")
     def test_filesystem_colon_sibling_does_not_escape_scope(self):
         runner = self.runner()
         omen_worker = self.omen_worker()
@@ -304,6 +338,83 @@ class CapabilityBoundaryTests(unittest.TestCase):
                     },
                 )
 
+    @unittest.skipUnless(os.name == "posix", "descriptor-safe filesystem broker is POSIX v0.1")
+    def test_symlink_component_is_rejected_before_worker_execution(self):
+        runner = self.runner()
+        omen_worker = self.omen_worker()
+        with tempfile.TemporaryDirectory() as allowed:
+            root = Path(allowed).resolve()
+            real_dir = root / "real"
+            real_dir.mkdir()
+            source = real_dir / "in.wav"
+            source.write_bytes(b"placeholder")
+            link = root / "route"
+            link.symlink_to(real_dir, target_is_directory=True)
+            output = root / "out.wav"
+            lease = self.authority.issue_lease(
+                subject=omen_worker.worker_id,
+                capabilities=["audio.master"],
+                resource_scopes=["catalog/masters", str(root)],
+            )
+            with self.assertRaises(ResourceDenied):
+                runner.execute(
+                    lease=lease,
+                    worker=omen_worker,
+                    payload={
+                        "input_path": str(link / "in.wav"),
+                        "output_path": str(output),
+                        "dry_run": True,
+                    },
+                )
+
+    @unittest.skipUnless(os.name == "posix", "process-group regression uses POSIX executable semantics")
+    def test_worker_timeout_kills_ffmpeg_descendant(self):
+        runner = self.runner()
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as fake_bin:
+            root = Path(allowed).resolve()
+            source = root / "in.wav"
+            source.write_bytes(b"placeholder")
+            output = root / "out.wav"
+            marker = root / "descendant-survived.txt"
+
+            fake_ffmpeg = Path(fake_bin) / "ffmpeg"
+            fake_ffmpeg.write_text(
+                "#!{}\n"
+                "import time\n"
+                "from pathlib import Path\n"
+                "time.sleep(0.8)\n"
+                "Path({!r}).write_text('survived')\n".format(sys.executable, str(marker)),
+                encoding="utf-8",
+            )
+            fake_ffmpeg.chmod(0o755)
+
+            omen_worker = self.omen_worker(timeout_seconds=0.15)
+            lease = self.authority.issue_lease(
+                subject=omen_worker.worker_id,
+                capabilities=["audio.master"],
+                resource_scopes=["catalog/masters", str(root)],
+            )
+
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(fake_bin) + os.pathsep + old_path
+            try:
+                with self.assertRaises(WorkerTimeout):
+                    runner.execute(
+                        lease=lease,
+                        worker=omen_worker,
+                        payload={
+                            "input_path": str(source),
+                            "output_path": str(output),
+                        },
+                    )
+            finally:
+                os.environ["PATH"] = old_path
+
+            time.sleep(1.0)
+            self.assertFalse(marker.exists())
+            self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.name == "posix", "descriptor-safe filesystem broker is POSIX v0.1")
     def test_omen_dry_run_succeeds_when_actual_paths_are_in_scope(self):
         runner = self.runner()
         omen_worker = self.omen_worker()
@@ -328,6 +439,8 @@ class CapabilityBoundaryTests(unittest.TestCase):
             )
             self.assertEqual(result["status"], "DRY_RUN")
             self.assertEqual(result["sample_rate"], 48000)
+            self.assertEqual(result["input"], str(source))
+            self.assertEqual(result["output"], str(output))
             self.authority.verify_receipt(receipt)
 
 
