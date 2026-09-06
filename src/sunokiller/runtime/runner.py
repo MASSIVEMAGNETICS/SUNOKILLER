@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -36,11 +37,11 @@ class WorkerTimeout(WorkerExecutionError):
 
 @dataclass(frozen=True)
 class WorkerSpec:
-    """Execution limits and exact import target.
+    """Caller request for a registered worker and stricter execution limits.
 
-    Security-sensitive capability/resource policy is deliberately NOT supplied
-    here. A caller may request a registered worker and tune bounded execution
-    limits, but cannot declare what that worker is authorized to do.
+    Capability/resource policy and the maximum resource budget are deliberately
+    NOT supplied here. A caller may request a registered worker and choose a
+    *stricter* finite budget, but cannot disable or raise the trusted maxima.
     """
 
     module: str
@@ -59,6 +60,9 @@ class WorkerPolicy:
     worker_id: str
     capability: str
     logical_resource: str
+    max_timeout_seconds: float
+    max_memory_mb: int
+    max_cpu_seconds: int
     filesystem_inputs: Tuple[str, ...] = ()
     filesystem_outputs: Tuple[str, ...] = ()
 
@@ -76,22 +80,40 @@ _TRUSTED_WORKER_POLICIES = {
         worker_id="sunokiller.runtime.demo_worker:update_counter",
         capability="audio.master",
         logical_resource="catalog/masters/demo",
+        max_timeout_seconds=30.0,
+        max_memory_mb=1024,
+        max_cpu_seconds=30,
     ),
     "sunokiller.omen:mastering_worker": WorkerPolicy(
         worker_id="sunokiller.omen:mastering_worker",
         capability="audio.master",
         logical_resource="catalog/masters/omen",
+        max_timeout_seconds=900.0,
+        max_memory_mb=4096,
+        max_cpu_seconds=900,
         filesystem_inputs=("input_path",),
         filesystem_outputs=("output_path",),
     ),
 }
 
 
+# Pin child imports to the same installed/editable source root that supplied
+# this trusted runner module. `python -I` removes the ambient CWD, PYTHONPATH,
+# user-site and other Python environment influence; this path is then inserted
+# explicitly inside the fresh interpreter before worker_entry is imported.
+_TRUSTED_SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
+
+
 def _minimal_environment() -> Dict[str, str]:
-    allowed = {}
+    """Return only non-Python ambient variables needed by bounded workers.
+
+    PYTHONPATH is intentionally never forwarded. The child is also launched
+    with `-I`, which ignores Python-specific environment variables and removes
+    the current working directory from the import search path.
+    """
+    allowed: Dict[str, str] = {}
     for key in (
         "PATH",
-        "PYTHONPATH",
         "SYSTEMROOT",
         "WINDIR",
         "TEMP",
@@ -104,24 +126,13 @@ def _minimal_environment() -> Dict[str, str]:
     return allowed
 
 
-def _resource_limiter(
-    max_memory_mb: Optional[int],
-    max_cpu_seconds: Optional[int],
-):
-    if os.name != "posix":
-        return None
-
-    def apply_limits() -> None:
-        import resource
-
-        if max_memory_mb:
-            limit = int(max_memory_mb) * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-        if max_cpu_seconds:
-            cpu = int(max_cpu_seconds)
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-
-    return apply_limits
+def _isolated_worker_command() -> Tuple[str, ...]:
+    bootstrap = (
+        "import runpy,sys;"
+        "sys.path.insert(0,{!r});"
+        "runpy.run_module('sunokiller.runtime.worker_entry',run_name='__main__')"
+    ).format(_TRUSTED_SOURCE_ROOT)
+    return (sys.executable, "-I", "-c", bootstrap)
 
 
 def _terminate_process_tree(process: subprocess.Popen) -> None:
@@ -441,14 +452,21 @@ class _FilesystemStager:
 class IsolatedRunner:
     """Run a registered, capability-leased worker in a separate interpreter.
 
-    The child receives only the JSON job payload and a minimized environment.
-    It cannot write canonical state directly; it may only propose `_state`,
-    which the parent commits transactionally after successful execution.
+    The child receives only the JSON job payload plus trusted finite resource
+    limits and a minimized environment. It cannot write canonical state
+    directly; it may only propose `_state`, which the parent commits
+    transactionally after successful execution.
 
     Security contract:
     - exact worker code target must exist in the trusted worker-policy registry;
     - the signed lease subject must equal that exact module:function worker_id;
     - capability/logical-resource policy comes only from the trusted registry;
+    - caller resource limits must be finite, positive, and no greater than the
+      trusted per-worker maxima;
+    - the child starts with Python isolated mode and a pinned trusted package
+      source root, never ambient CWD/PYTHONPATH import resolution;
+    - POSIX CPU/memory limits are applied inside worker_entry after exec, not
+      through preexec_fn in the multithreaded parent;
     - filesystem workers use descriptor-bound, no-follow staging on POSIX;
     - the worker never receives the original authorized filesystem paths;
     - lease validity is rechecked after the subprocess returns;
@@ -476,6 +494,54 @@ class IsolatedRunner:
                 "worker is not registered in trusted policy: {}".format(worker.worker_id)
             )
         return policy
+
+    @staticmethod
+    def _validated_limits(worker: WorkerSpec, policy: WorkerPolicy) -> Dict[str, Any]:
+        timeout = worker.timeout_seconds
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or float(timeout) <= 0
+            or float(timeout) > float(policy.max_timeout_seconds)
+        ):
+            raise WorkerExecutionError(
+                "timeout_seconds must be finite, positive, and <= {} for {}".format(
+                    policy.max_timeout_seconds, policy.worker_id
+                )
+            )
+
+        memory = worker.max_memory_mb
+        if (
+            isinstance(memory, bool)
+            or not isinstance(memory, int)
+            or memory <= 0
+            or memory > policy.max_memory_mb
+        ):
+            raise WorkerExecutionError(
+                "max_memory_mb must be a positive integer <= {} for {}".format(
+                    policy.max_memory_mb, policy.worker_id
+                )
+            )
+
+        cpu = worker.max_cpu_seconds
+        if (
+            isinstance(cpu, bool)
+            or not isinstance(cpu, int)
+            or cpu <= 0
+            or cpu > policy.max_cpu_seconds
+        ):
+            raise WorkerExecutionError(
+                "max_cpu_seconds must be a positive integer <= {} for {}".format(
+                    policy.max_cpu_seconds, policy.worker_id
+                )
+            )
+
+        return {
+            "timeout_seconds": float(timeout),
+            "max_memory_mb": int(memory),
+            "max_cpu_seconds": int(cpu),
+        }
 
     def _verify_worker_and_resources(
         self,
@@ -515,9 +581,10 @@ class IsolatedRunner:
         *,
         worker: WorkerSpec,
         envelope: Mapping[str, Any],
+        limits: Mapping[str, Any],
     ) -> Tuple[int, str, str]:
-        args = [sys.executable, "-m", "sunokiller.runtime.worker_entry"]
-        kwargs = {
+        args = list(_isolated_worker_command())
+        kwargs: Dict[str, Any] = {
             "stdin": subprocess.PIPE,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
@@ -526,11 +593,10 @@ class IsolatedRunner:
         }
 
         if os.name == "posix":
+            # start_new_session is implemented by subprocess without running a
+            # Python preexec callback. Resource limits are applied after exec in
+            # the trusted worker_entry process, avoiding fork-time deadlocks.
             kwargs["start_new_session"] = True
-            kwargs["preexec_fn"] = _resource_limiter(
-                worker.max_memory_mb,
-                worker.max_cpu_seconds,
-            )
         elif os.name == "nt":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
@@ -538,7 +604,7 @@ class IsolatedRunner:
         try:
             stdout, stderr = process.communicate(
                 json.dumps(dict(envelope)),
-                timeout=worker.timeout_seconds,
+                timeout=float(limits["timeout_seconds"]),
             )
         except subprocess.TimeoutExpired as exc:
             _terminate_process_tree(process)
@@ -564,6 +630,7 @@ class IsolatedRunner:
             worker=worker,
             payload=input_payload,
         )
+        limits = self._validated_limits(worker, policy)
 
         pre = self.state_store.load_latest(self.state_key)
         pre_hash = pre.state_hash if pre else digest_json({})
@@ -579,11 +646,16 @@ class IsolatedRunner:
                 "module": worker.module,
                 "function": worker.function,
                 "payload": stager.execution_payload,
+                "limits": {
+                    "max_memory_mb": limits["max_memory_mb"],
+                    "max_cpu_seconds": limits["max_cpu_seconds"],
+                },
             }
 
             returncode, stdout, stderr = self._run_worker(
                 worker=worker,
                 envelope=envelope,
+                limits=limits,
             )
 
             if returncode != 0:
@@ -606,6 +678,7 @@ class IsolatedRunner:
                 worker=worker,
                 payload=input_payload,
             )
+            self._validated_limits(worker, policy)
 
             result = dict(message["result"])
             proposed_state = result.pop("_state", None)
