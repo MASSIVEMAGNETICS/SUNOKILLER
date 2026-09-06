@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, Mapping, Optional, Set
+from typing import Any, Dict, Iterator, Mapping, Optional, Set
 
 from .contracts import LeaseExpired, LeaseRevoked, canonical_json, digest_json
 
@@ -96,6 +97,16 @@ class SQLiteStateStore:
         if expires_at is not None and int(time.time()) >= int(expires_at):
             raise LeaseExpired("lease expired before commit boundary")
 
+    def _assert_lease_active_locked(
+        self,
+        lease_id: str,
+        *,
+        expires_at: Optional[int] = None,
+    ) -> None:
+        if self._lease_is_revoked_locked(lease_id):
+            raise LeaseRevoked("lease has been revoked")
+        self._assert_not_expired(expires_at)
+
     def assert_lease_active(
         self,
         lease_id: str,
@@ -104,9 +115,34 @@ class SQLiteStateStore:
     ) -> None:
         """Fail if revocation/expiry is already durable at this instant."""
         with self._lock:
-            if self._lease_is_revoked_locked(lease_id):
-                raise LeaseRevoked("lease has been revoked")
-            self._assert_not_expired(expires_at)
+            self._assert_lease_active_locked(lease_id, expires_at=expires_at)
+
+    @contextmanager
+    def lease_commit_guard(
+        self,
+        lease_id: str,
+        *,
+        expires_at: Optional[int] = None,
+    ) -> Iterator[None]:
+        """Linearize one bounded external side effect against STOP/revocation.
+
+        The guard acquires SQLite's write lock with BEGIN IMMEDIATE, checks the
+        lease only after that lock is held, then retains the transaction until
+        the guarded external commit finishes. A concurrent revoke either lands
+        first and blocks the side effect, or waits until the already-authorized
+        side effect has completed. This is intended for short finalization
+        operations such as atomically publishing a staged output file; long
+        worker execution must never run inside this guard.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_lease_active_locked(lease_id, expires_at=expires_at)
+                yield
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def save_snapshot(
         self,
@@ -133,9 +169,10 @@ class SQLiteStateStore:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 if lease_id is not None:
-                    if self._lease_is_revoked_locked(lease_id):
-                        raise LeaseRevoked("lease revoked before canonical state commit")
-                    self._assert_not_expired(lease_expires_at)
+                    self._assert_lease_active_locked(
+                        lease_id,
+                        expires_at=lease_expires_at,
+                    )
 
                 row = self._conn.execute(
                     """
@@ -188,7 +225,7 @@ class SQLiteStateStore:
 
     def revoke_lease(self, lease_id: str, reason: str = "revoked") -> None:
         # Revocations share the same connection and therefore the same lock as
-        # state commits. This makes the Human STOP path transaction-safe.
+        # state commits and guarded external side-effect finalization.
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
