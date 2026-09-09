@@ -309,7 +309,14 @@ def _wait_bounded_io_child(pid: int, *, deadline: float, operation: str) -> None
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            os.waitpid(pid, 0)
+            # Never wait without a bound, even if the kernel has the child in
+            # an uninterruptible filesystem operation.
+            reap_deadline = time.monotonic() + 0.25
+            while time.monotonic() < reap_deadline:
+                completed, _ = os.waitpid(pid, os.WNOHANG)
+                if completed == pid:
+                    break
+                time.sleep(0.01)
             raise WorkerTimeout("{} exceeded end-to-end deadline".format(operation))
         time.sleep(0.01)
 
