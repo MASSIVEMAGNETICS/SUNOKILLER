@@ -18,7 +18,13 @@ from sunokiller.runtime.contracts import (
     LeaseRevoked,
     ResourceDenied,
 )
-from sunokiller.runtime.runner import WorkerExecutionError, WorkerTimeout
+from sunokiller.runtime.runner import (
+    WorkerExecutionError,
+    WorkerTimeout,
+    _atomic_commit_output_to_scope,
+    _copy_regular_input_from_scope,
+    _open_directory_no_symlinks,
+)
 from sunokiller.runtime.state import NO_SNAPSHOT_PRECONDITION, StateConflict
 from sunokiller.omen import OmenError, build_master_command
 
@@ -579,6 +585,68 @@ class CapabilityBoundaryTests(unittest.TestCase):
                     },
                 )
             self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
+    def test_blocking_input_copy_cannot_overrun_deadline(self):
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
+            root = Path(allowed).resolve()
+            source = root / "in.wav"
+            source.write_bytes(b"audio")
+            target = Path(staging) / "staged.wav"
+            scope_fd = _open_directory_no_symlinks(root)
+            real_open = Path.open
+
+            def blocking_open(path, *args, **kwargs):
+                if Path(path) == target:
+                    time.sleep(5)
+                return real_open(path, *args, **kwargs)
+
+            started = time.monotonic()
+            try:
+                with mock.patch.object(Path, "open", blocking_open):
+                    with self.assertRaises(WorkerTimeout):
+                        _copy_regular_input_from_scope(
+                            scope_fd,
+                            Path("in.wav"),
+                            target,
+                            max_bytes=1024,
+                            deadline=time.monotonic() + 0.1,
+                        )
+            finally:
+                os.close(scope_fd)
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertFalse(target.exists())
+
+    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
+    def test_blocking_output_publication_cannot_block_human_stop_boundary(self):
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
+            root = Path(allowed).resolve()
+            source = Path(staging) / "master.wav"
+            source.write_bytes(b"master")
+            target = root / "out.wav"
+            scope_fd = _open_directory_no_symlinks(root)
+            real_open = Path.open
+
+            def blocking_open(path, *args, **kwargs):
+                if Path(path) == source:
+                    time.sleep(5)
+                return real_open(path, *args, **kwargs)
+
+            started = time.monotonic()
+            try:
+                with mock.patch.object(Path, "open", blocking_open):
+                    with self.assertRaises(WorkerTimeout):
+                        _atomic_commit_output_to_scope(
+                            scope_fd,
+                            Path("out.wav"),
+                            source,
+                            max_bytes=1024,
+                            deadline=time.monotonic() + 0.1,
+                        )
+            finally:
+                os.close(scope_fd)
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertFalse(target.exists())
 
     @unittest.skipUnless(os.name == "posix", "descriptor-safe filesystem broker is POSIX v0.1")
     def test_omen_dry_run_succeeds_when_actual_paths_are_in_scope(self):
