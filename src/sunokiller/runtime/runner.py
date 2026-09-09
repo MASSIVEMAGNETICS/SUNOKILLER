@@ -66,6 +66,7 @@ class WorkerPolicy:
     filesystem_inputs: Tuple[str, ...] = ()
     filesystem_outputs: Tuple[str, ...] = ()
     max_input_bytes: int = 0
+    max_output_bytes: int = 0
 
     @property
     def filesystem_fields(self) -> Tuple[str, ...]:
@@ -95,6 +96,7 @@ _TRUSTED_WORKER_POLICIES = {
         filesystem_inputs=("input_path",),
         filesystem_outputs=("output_path",),
         max_input_bytes=8 * 1024 * 1024 * 1024,
+        max_output_bytes=8 * 1024 * 1024 * 1024,
     ),
 }
 
@@ -292,6 +294,26 @@ def _open_parent_from_scope(
         raise
 
 
+def _wait_bounded_io_child(pid: int, *, deadline: float, operation: str) -> None:
+    """Wait for a killable staging child without trusting blocking filesystem I/O."""
+    while True:
+        completed, status = os.waitpid(pid, os.WNOHANG)
+        if completed == pid:
+            if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+                return
+            if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2:
+                raise ResourceDenied("{} exceeded its trusted byte limit".format(operation))
+            raise WorkerExecutionError("{} failed in bounded staging child".format(operation))
+        if time.monotonic() >= deadline:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pid, 0)
+            raise WorkerTimeout("{} exceeded end-to-end deadline".format(operation))
+        time.sleep(0.01)
+
+
 def _copy_regular_input_from_scope(
     scope_fd: int,
     relative: Path,
@@ -311,70 +333,102 @@ def _copy_regular_input_from_scope(
             raise ResourceDenied("hard-linked input is not allowed: {}".format(relative))
         if max_bytes <= 0 or info.st_size > max_bytes:
             raise ResourceDenied("input exceeds trusted staging byte limit: {}".format(relative))
-        copied = 0
-        with os.fdopen(os.dup(fd), "rb") as source, target.open("wb") as destination:
-            while True:
-                if time.monotonic() >= deadline:
-                    raise WorkerTimeout("input staging exceeded end-to-end deadline")
-                chunk = source.read(min(1024 * 1024, max_bytes - copied + 1))
-                if not chunk:
-                    break
-                copied += len(chunk)
-                if copied > max_bytes:
-                    raise ResourceDenied(
-                        "input exceeds trusted staging byte limit: {}".format(relative)
-                    )
-                destination.write(chunk)
+        if time.monotonic() >= deadline:
+            raise WorkerTimeout("input staging exceeded end-to-end deadline")
+
+        pid = os.fork()
+        if pid == 0:
+            try:
+                copied = 0
+                with os.fdopen(os.dup(fd), "rb") as source, target.open("wb") as destination:
+                    while True:
+                        chunk = source.read(min(1024 * 1024, max_bytes - copied + 1))
+                        if not chunk:
+                            break
+                        copied += len(chunk)
+                        if copied > max_bytes:
+                            os._exit(2)
+                        destination.write(chunk)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        _wait_bounded_io_child(pid, deadline=deadline, operation="input staging")
     finally:
         if fd is not None:
             os.close(fd)
         os.close(parent_fd)
+        if not target.is_file():
+            try:
+                target.unlink()
+            except OSError:
+                pass
 
 
-def _atomic_commit_output_to_scope(scope_fd: int, relative: Path, source: Path) -> None:
+def _atomic_commit_output_to_scope(
+    scope_fd: int,
+    relative: Path,
+    source: Path,
+    *,
+    max_bytes: int,
+    deadline: float,
+) -> None:
     if not source.is_file():
         raise WorkerExecutionError(
             "worker completed without required staged output: {}".format(source)
         )
+    if max_bytes <= 0 or source.stat().st_size > max_bytes:
+        raise ResourceDenied("output exceeds trusted publication byte limit: {}".format(relative))
+    if time.monotonic() >= deadline:
+        raise WorkerTimeout("output publication exceeded end-to-end deadline")
 
     parent_fd, name = _open_parent_from_scope(scope_fd, relative, create_missing=True)
     temp_name = ".{}.sunokiller-{}".format(name, uuid.uuid4().hex)
-    fd = None
     try:
-        fd = os.open(
-            temp_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=parent_fd,
-        )
-        with source.open("rb") as staged, os.fdopen(os.dup(fd), "wb") as destination:
-            shutil.copyfileobj(staged, destination, length=1024 * 1024)
-            destination.flush()
-            os.fsync(destination.fileno())
-        os.close(fd)
-        fd = None
-
-        # Both source and destination names are relative to the already-opened
-        # authorized parent directory. A symlink swap cannot redirect this.
-        os.replace(
-            temp_name,
-            name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-        )
-        try:
-            os.fsync(parent_fd)
-        except OSError:
-            pass
-    except Exception:
+        pid = os.fork()
+        if pid == 0:
+            fd = None
+            try:
+                fd = os.open(
+                    temp_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                copied = 0
+                with source.open("rb") as staged, os.fdopen(os.dup(fd), "wb") as destination:
+                    while True:
+                        chunk = staged.read(min(1024 * 1024, max_bytes - copied + 1))
+                        if not chunk:
+                            break
+                        copied += len(chunk)
+                        if copied > max_bytes:
+                            os._exit(2)
+                        destination.write(chunk)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                os.close(fd)
+                fd = None
+                os.replace(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                try:
+                    os.fsync(parent_fd)
+                except OSError:
+                    pass
+                os._exit(0)
+            except BaseException:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                os._exit(1)
+        _wait_bounded_io_child(pid, deadline=deadline, operation="output publication")
+    finally:
         try:
             os.unlink(temp_name, dir_fd=parent_fd)
         except OSError:
             pass
-        raise
-    finally:
-        if fd is not None:
-            os.close(fd)
         os.close(parent_fd)
 
 
@@ -463,7 +517,13 @@ class _FilesystemStager:
         if self.original_payload.get("dry_run"):
             return
         for scope_fd, relative, staged in self._output_commits:
-            _atomic_commit_output_to_scope(scope_fd, relative, staged)
+            _atomic_commit_output_to_scope(
+                scope_fd,
+                relative,
+                staged,
+                max_bytes=self.policy.max_output_bytes,
+                deadline=self._deadline,
+            )
 
     def restore_public_paths(self, result: Dict[str, Any]) -> Dict[str, Any]:
         restored = dict(result)
