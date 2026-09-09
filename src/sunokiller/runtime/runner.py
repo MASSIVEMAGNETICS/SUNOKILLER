@@ -65,6 +65,7 @@ class WorkerPolicy:
     max_cpu_seconds: int
     filesystem_inputs: Tuple[str, ...] = ()
     filesystem_outputs: Tuple[str, ...] = ()
+    max_input_bytes: int = 0
 
     @property
     def filesystem_fields(self) -> Tuple[str, ...]:
@@ -93,6 +94,7 @@ _TRUSTED_WORKER_POLICIES = {
         max_cpu_seconds=900,
         filesystem_inputs=("input_path",),
         filesystem_outputs=("output_path",),
+        max_input_bytes=8 * 1024 * 1024 * 1024,
     ),
 }
 
@@ -137,27 +139,34 @@ def _isolated_worker_command() -> Tuple[str, ...]:
 
 def _terminate_process_tree(process: subprocess.Popen) -> None:
     """Best-effort hard stop for the worker and every descendant it spawned."""
-    if process.poll() is not None:
-        return
-
     if os.name == "posix":
+        # The session/process-group can outlive its leader. Always target the
+        # group even when poll() says the Python worker has already exited.
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
-            return
-        try:
-            process.wait(timeout=1.0)
-            return
-        except subprocess.TimeoutExpired:
             pass
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
-            return
+            pass
         try:
-            process.wait(timeout=1.0)
+            process.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
-            process.kill()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        return
+
+    if process.poll() is not None:
         return
 
     if os.name == "nt":
@@ -283,7 +292,14 @@ def _open_parent_from_scope(
         raise
 
 
-def _copy_regular_input_from_scope(scope_fd: int, relative: Path, target: Path) -> None:
+def _copy_regular_input_from_scope(
+    scope_fd: int,
+    relative: Path,
+    target: Path,
+    *,
+    max_bytes: int,
+    deadline: float,
+) -> None:
     parent_fd, name = _open_parent_from_scope(scope_fd, relative, create_missing=False)
     fd = None
     try:
@@ -293,8 +309,22 @@ def _copy_regular_input_from_scope(scope_fd: int, relative: Path, target: Path) 
             raise ResourceDenied(str(relative))
         if info.st_nlink != 1:
             raise ResourceDenied("hard-linked input is not allowed: {}".format(relative))
+        if max_bytes <= 0 or info.st_size > max_bytes:
+            raise ResourceDenied("input exceeds trusted staging byte limit: {}".format(relative))
+        copied = 0
         with os.fdopen(os.dup(fd), "rb") as source, target.open("wb") as destination:
-            shutil.copyfileobj(source, destination, length=1024 * 1024)
+            while True:
+                if time.monotonic() >= deadline:
+                    raise WorkerTimeout("input staging exceeded end-to-end deadline")
+                chunk = source.read(min(1024 * 1024, max_bytes - copied + 1))
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > max_bytes:
+                    raise ResourceDenied(
+                        "input exceeds trusted staging byte limit: {}".format(relative)
+                    )
+                destination.write(chunk)
     finally:
         if fd is not None:
             os.close(fd)
@@ -363,6 +393,7 @@ class _FilesystemStager:
         lease: CapabilityLease,
         policy: WorkerPolicy,
         payload: Mapping[str, Any],
+        deadline: float,
     ) -> None:
         self.lease = lease
         self.policy = policy
@@ -373,6 +404,7 @@ class _FilesystemStager:
         self._scope_fds = []
         self._output_commits = []
         self._public_path_map = {}
+        self._deadline = deadline
 
     def __enter__(self) -> "_FilesystemStager":
         if not self.policy.filesystem_fields:
@@ -394,7 +426,13 @@ class _FilesystemStager:
                 self._scope_fds.append(scope_fd)
                 suffix = Path(raw).suffix
                 staged = self._root / "input-{}{}".format(index, suffix)
-                _copy_regular_input_from_scope(scope_fd, relative, staged)
+                _copy_regular_input_from_scope(
+                    scope_fd,
+                    relative,
+                    staged,
+                    max_bytes=self.policy.max_input_bytes,
+                    deadline=self._deadline,
+                )
                 self.execution_payload[field] = str(staged)
                 self._public_path_map[str(staged)] = str(_normalized_absolute_path(raw))
 
@@ -481,10 +519,12 @@ class IsolatedRunner:
         authority: HMACAuthority,
         state_store: SQLiteStateStore,
         state_key: str,
+        trusted_executables: Optional[Mapping[str, str]] = None,
     ) -> None:
         self.authority = authority
         self.state_store = state_store
         self.state_key = state_key
+        self.trusted_executables = dict(trusted_executables or {})
 
     @staticmethod
     def _policy_for(worker: WorkerSpec) -> WorkerPolicy:
@@ -611,8 +651,18 @@ class IsolatedRunner:
             try:
                 stdout, stderr = process.communicate(timeout=1.0)
             except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
+                _terminate_process_tree(process)
+                try:
+                    stdout, stderr = process.communicate(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    # Never turn timeout recovery into an unbounded pipe drain.
+                    for stream in (process.stdin, process.stdout, process.stderr):
+                        if stream is not None:
+                            try:
+                                stream.close()
+                            except OSError:
+                                pass
+                    stdout, stderr = "", "worker pipes did not close after process-group kill"
             raise WorkerTimeout(worker.worker_id) from exc
 
         return process.returncode, stdout, stderr
@@ -636,12 +686,28 @@ class IsolatedRunner:
         pre_hash = pre.state_hash if pre else digest_json({})
         started = int(time.time())
         input_hash = digest_json(input_payload)
+        deadline = time.monotonic() + float(limits["timeout_seconds"])
 
         with _FilesystemStager(
             lease=lease,
             policy=policy,
             payload=input_payload,
+            deadline=deadline,
         ) as stager:
+            if policy.worker_id == "sunokiller.omen:mastering_worker" and not input_payload.get("dry_run"):
+                ffmpeg = self.trusted_executables.get("ffmpeg")
+                if not ffmpeg:
+                    raise WorkerExecutionError("trusted ffmpeg executable is not configured")
+                ffmpeg_path = Path(ffmpeg)
+                if (
+                    not ffmpeg_path.is_absolute()
+                    or ffmpeg_path.is_symlink()
+                    or not ffmpeg_path.is_file()
+                    or not os.access(str(ffmpeg_path), os.X_OK)
+                ):
+                    raise WorkerExecutionError("trusted ffmpeg executable must be an absolute executable regular file")
+                stager.execution_payload["_trusted_ffmpeg_path"] = str(ffmpeg_path)
+
             envelope = {
                 "module": worker.module,
                 "function": worker.function,
@@ -652,10 +718,15 @@ class IsolatedRunner:
                 },
             }
 
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WorkerTimeout("end-to-end execution deadline expired during staging")
+            worker_limits = dict(limits)
+            worker_limits["timeout_seconds"] = remaining
             returncode, stdout, stderr = self._run_worker(
                 worker=worker,
                 envelope=envelope,
-                limits=limits,
+                limits=worker_limits,
             )
 
             if returncode != 0:
