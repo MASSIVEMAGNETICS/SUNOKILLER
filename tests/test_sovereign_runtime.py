@@ -7,7 +7,9 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
+import sunokiller.runtime.runner as runner_module
 from sunokiller.runtime import HMACAuthority, IsolatedRunner, SQLiteStateStore, WorkerSpec
 from sunokiller.runtime.contracts import (
     CapabilityDenied,
@@ -36,11 +38,12 @@ class CapabilityBoundaryTests(unittest.TestCase):
         except OSError:
             pass
 
-    def runner(self):
+    def runner(self, trusted_executables=None):
         return IsolatedRunner(
             authority=self.authority,
             state_store=self.store,
             state_key="runtime",
+            trusted_executables=trusted_executables,
         )
 
     def demo_worker(self):
@@ -420,7 +423,6 @@ class CapabilityBoundaryTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "process-group regression uses POSIX executable semantics")
     def test_worker_timeout_kills_ffmpeg_descendant(self):
-        runner = self.runner()
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as fake_bin:
             root = Path(allowed).resolve()
             source = root / "in.wav"
@@ -438,6 +440,7 @@ class CapabilityBoundaryTests(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_ffmpeg.chmod(0o755)
+            runner = self.runner({"ffmpeg": str(fake_ffmpeg)})
 
             omen_worker = self.omen_worker(timeout_seconds=0.15)
             lease = self.authority.issue_lease(
@@ -463,6 +466,118 @@ class CapabilityBoundaryTests(unittest.TestCase):
 
             time.sleep(1.0)
             self.assertFalse(marker.exists())
+            self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.name == "posix", "process-group regression uses POSIX executable semantics")
+    def test_timeout_kills_group_when_worker_leader_already_exited(self):
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as fake_bin:
+            root = Path(allowed).resolve()
+            source = root / "in.wav"
+            source.write_bytes(b"placeholder")
+            output = root / "out.wav"
+            marker = root / "orphan-survived.txt"
+            fake_ffmpeg = Path(fake_bin) / "ffmpeg"
+            fake_ffmpeg.write_text(
+                "#!{}\n"
+                "import subprocess,sys\n"
+                "subprocess.Popen([sys.executable, '-c', "
+                "\"import time; from pathlib import Path; time.sleep(0.8); "
+                "Path({!r}).write_text('survived')\"])\n".format(
+                    sys.executable, str(marker)
+                ),
+                encoding="utf-8",
+            )
+            fake_ffmpeg.chmod(0o755)
+            runner = self.runner({"ffmpeg": str(fake_ffmpeg)})
+            lease = self.authority.issue_lease(
+                subject=self.omen_worker().worker_id,
+                capabilities=["audio.master"],
+                resource_scopes=["catalog/masters", str(root)],
+            )
+            with self.assertRaises(WorkerTimeout):
+                runner.execute(
+                    lease=lease,
+                    worker=self.omen_worker(timeout_seconds=0.15),
+                    payload={"input_path": str(source), "output_path": str(output)},
+                )
+            time.sleep(1.0)
+            self.assertFalse(marker.exists())
+            self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.name == "posix", "trusted executable regression uses POSIX executable semantics")
+    def test_omen_uses_pinned_ffmpeg_not_ambient_path(self):
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as trusted_bin, tempfile.TemporaryDirectory() as hostile_bin:
+            root = Path(allowed).resolve()
+            source = root / "in.wav"
+            source.write_bytes(b"audio")
+            output = root / "out.wav"
+            marker = root / "ambient-ffmpeg-ran.txt"
+            trusted = Path(trusted_bin) / "ffmpeg"
+            trusted.write_text(
+                "#!{}\nfrom pathlib import Path\nimport sys\n"
+                "Path(sys.argv[-1]).write_bytes(b'mastered')\n".format(sys.executable),
+                encoding="utf-8",
+            )
+            trusted.chmod(0o755)
+            hostile = Path(hostile_bin) / "ffmpeg"
+            hostile.write_text(
+                "#!{}\nfrom pathlib import Path\nPath({!r}).write_text('owned')\n".format(
+                    sys.executable, str(marker)
+                ),
+                encoding="utf-8",
+            )
+            hostile.chmod(0o755)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(hostile_bin) + os.pathsep + old_path
+            try:
+                runner = self.runner({"ffmpeg": str(trusted)})
+                lease = self.authority.issue_lease(
+                    subject=self.omen_worker().worker_id,
+                    capabilities=["audio.master"],
+                    resource_scopes=["catalog/masters", str(root)],
+                )
+                result, receipt = runner.execute(
+                    lease=lease,
+                    worker=self.omen_worker(),
+                    payload={"input_path": str(source), "output_path": str(output)},
+                )
+            finally:
+                os.environ["PATH"] = old_path
+            self.assertEqual(result["status"], "MASTERED")
+            self.assertEqual(output.read_bytes(), b"mastered")
+            self.assertFalse(marker.exists())
+            self.authority.verify_receipt(receipt)
+
+    @unittest.skipUnless(os.name == "posix", "descriptor-safe filesystem broker is POSIX v0.1")
+    def test_input_staging_enforces_trusted_byte_limit(self):
+        policy_id = self.omen_worker().worker_id
+        limited = dataclasses.replace(
+            runner_module._TRUSTED_WORKER_POLICIES[policy_id],
+            max_input_bytes=4,
+        )
+        with tempfile.TemporaryDirectory() as allowed, mock.patch.dict(
+            runner_module._TRUSTED_WORKER_POLICIES,
+            {policy_id: limited},
+        ):
+            root = Path(allowed).resolve()
+            source = root / "in.wav"
+            source.write_bytes(b"12345")
+            output = root / "out.wav"
+            lease = self.authority.issue_lease(
+                subject=policy_id,
+                capabilities=["audio.master"],
+                resource_scopes=["catalog/masters", str(root)],
+            )
+            with self.assertRaises(ResourceDenied):
+                self.runner().execute(
+                    lease=lease,
+                    worker=self.omen_worker(),
+                    payload={
+                        "input_path": str(source),
+                        "output_path": str(output),
+                        "dry_run": True,
+                    },
+                )
             self.assertFalse(output.exists())
 
     @unittest.skipUnless(os.name == "posix", "descriptor-safe filesystem broker is POSIX v0.1")
