@@ -47,6 +47,7 @@ def build_master_command(
     true_peak: float = -1.0,
     loudness_range: float = 11.0,
     sample_rate: int = MASTER_SAMPLE_RATE,
+    ffmpeg_path: str = "ffmpeg",
 ) -> List[str]:
     _require_master_sample_rate(sample_rate)
     out = Path(output_path)
@@ -54,7 +55,7 @@ def build_master_command(
     if codec is None:
         raise OmenError("unsupported output format: {}".format(out.suffix))
     return [
-        "ffmpeg",
+        ffmpeg_path,
         "-hide_banner",
         "-loglevel",
         "error",
@@ -90,6 +91,7 @@ def master_file(
     sample_rate: int = MASTER_SAMPLE_RATE,
     timeout_seconds: int = 900,
     dry_run: bool = False,
+    ffmpeg_path: str | None = None,
 ) -> Dict[str, Any]:
     _require_master_sample_rate(sample_rate)
     source = Path(input_path).expanduser().resolve()
@@ -106,6 +108,7 @@ def master_file(
         true_peak=true_peak,
         loudness_range=loudness_range,
         sample_rate=MASTER_SAMPLE_RATE,
+        ffmpeg_path=ffmpeg_path or "ffmpeg",
     )
 
     if dry_run:
@@ -117,8 +120,15 @@ def master_file(
             "sample_rate": MASTER_SAMPLE_RATE,
         }
 
-    if shutil.which("ffmpeg") is None:
-        raise OmenError("ffmpeg is required for OMEN mastering")
+    if ffmpeg_path is None:
+        discovered = shutil.which("ffmpeg")
+        if discovered is None:
+            raise OmenError("ffmpeg is required for OMEN mastering")
+        ffmpeg_path = str(Path(discovered).resolve())
+        cmd[0] = ffmpeg_path
+    executable = Path(ffmpeg_path)
+    if not executable.is_absolute() or executable.is_symlink() or not executable.is_file():
+        raise OmenError("ffmpeg executable must be a pinned absolute regular file")
 
     subprocess.run(cmd, check=True, timeout=timeout_seconds)
     if not target.is_file() or target.stat().st_size == 0:
@@ -148,6 +158,7 @@ def mastering_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
         sample_rate=int(payload.get("sample_rate", MASTER_SAMPLE_RATE)),
         timeout_seconds=int(payload.get("timeout_seconds", 900)),
         dry_run=bool(payload.get("dry_run", False)),
+        ffmpeg_path=payload.get("_trusted_ffmpeg_path"),
     )
 
 
