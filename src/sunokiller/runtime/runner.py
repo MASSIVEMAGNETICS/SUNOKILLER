@@ -375,6 +375,8 @@ def _copy_regular_input_from_scope(
                 destination.flush()
                 os.fsync(destination.fileno())
             os._exit(0)
+        except (OSError, ResourceDenied):
+            os._exit(3)
         except BaseException:
             os._exit(1)
         finally:
