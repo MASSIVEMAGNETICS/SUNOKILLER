@@ -333,6 +333,8 @@ def _wait_bounded_io_child(
                 return
             if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2:
                 raise ResourceDenied("{} exceeded its trusted byte limit".format(operation))
+            if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 3:
+                raise ResourceDenied("{} failed descriptor containment checks".format(operation))
             raise WorkerExecutionError("{} failed in bounded staging child".format(operation))
         if time.monotonic() >= deadline:
             _bounded_kill_and_reap(pid)
