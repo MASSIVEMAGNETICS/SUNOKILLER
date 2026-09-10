@@ -24,6 +24,7 @@ from sunokiller.runtime.runner import (
     _atomic_commit_output_to_scope,
     _copy_regular_input_from_scope,
     _open_directory_no_symlinks,
+    _open_directory_bounded,
 )
 from sunokiller.runtime.state import NO_SNAPSHOT_PRECONDITION, StateConflict
 from sunokiller.omen import OmenError, build_master_command
