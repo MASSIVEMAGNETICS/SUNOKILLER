@@ -729,7 +729,7 @@ class CapabilityBoundaryTests(unittest.TestCase):
             real_fsync = os.fsync
 
             def blocking_directory_fsync(fd):
-                if output.exists():
+                if output.exists() and output.read_bytes() == b"master":
                     time.sleep(5)
                 return real_fsync(fd)
 
