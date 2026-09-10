@@ -294,9 +294,39 @@ def _open_parent_from_scope(
         raise
 
 
-def _wait_bounded_io_child(pid: int, *, deadline: float, operation: str) -> None:
-    """Wait for a killable staging child without trusting blocking filesystem I/O."""
+def _bounded_kill_and_reap(pid: int) -> None:
+    """Kill a helper without ever turning cleanup into an unbounded wait."""
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    reap_deadline = time.monotonic() + 0.25
+    while time.monotonic() < reap_deadline:
+        try:
+            completed, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if completed == pid:
+            return
+        time.sleep(0.01)
+
+
+def _wait_bounded_io_child(
+    pid: int,
+    *,
+    deadline: float,
+    operation: str,
+    committed_fd: Optional[int] = None,
+) -> None:
+    """Wait for a killable I/O child, optionally honoring its visibility commit."""
     while True:
+        if committed_fd is not None:
+            try:
+                if os.read(committed_fd, 1) == b"C":
+                    _bounded_kill_and_reap(pid)
+                    return
+            except BlockingIOError:
+                pass
         completed, status = os.waitpid(pid, os.WNOHANG)
         if completed == pid:
             if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
@@ -305,18 +335,7 @@ def _wait_bounded_io_child(pid: int, *, deadline: float, operation: str) -> None
                 raise ResourceDenied("{} exceeded its trusted byte limit".format(operation))
             raise WorkerExecutionError("{} failed in bounded staging child".format(operation))
         if time.monotonic() >= deadline:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            # Never wait without a bound, even if the kernel has the child in
-            # an uninterruptible filesystem operation.
-            reap_deadline = time.monotonic() + 0.25
-            while time.monotonic() < reap_deadline:
-                completed, _ = os.waitpid(pid, os.WNOHANG)
-                if completed == pid:
-                    break
-                time.sleep(0.01)
+            _bounded_kill_and_reap(pid)
             raise WorkerTimeout("{} exceeded end-to-end deadline".format(operation))
         time.sleep(0.01)
 
@@ -329,43 +348,47 @@ def _copy_regular_input_from_scope(
     max_bytes: int,
     deadline: float,
 ) -> None:
-    parent_fd, name = _open_parent_from_scope(scope_fd, relative, create_missing=False)
-    fd = None
+    pid = os.fork()
+    if pid == 0:
+        parent_fd = None
+        fd = None
+        try:
+            parent_fd, name = _open_parent_from_scope(scope_fd, relative, create_missing=False)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                os._exit(3)
+            if max_bytes <= 0 or info.st_size > max_bytes:
+                os._exit(2)
+            copied = 0
+            with os.fdopen(os.dup(fd), "rb") as source, target.open("wb") as destination:
+                while True:
+                    chunk = source.read(min(1024 * 1024, max_bytes - copied + 1))
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > max_bytes:
+                        os._exit(2)
+                    destination.write(chunk)
+                destination.flush()
+                os.fsync(destination.fileno())
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if parent_fd is not None:
+                try:
+                    os.close(parent_fd)
+                except OSError:
+                    pass
     try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise ResourceDenied(str(relative))
-        if info.st_nlink != 1:
-            raise ResourceDenied("hard-linked input is not allowed: {}".format(relative))
-        if max_bytes <= 0 or info.st_size > max_bytes:
-            raise ResourceDenied("input exceeds trusted staging byte limit: {}".format(relative))
-        if time.monotonic() >= deadline:
-            raise WorkerTimeout("input staging exceeded end-to-end deadline")
-
-        pid = os.fork()
-        if pid == 0:
-            try:
-                copied = 0
-                with os.fdopen(os.dup(fd), "rb") as source, target.open("wb") as destination:
-                    while True:
-                        chunk = source.read(min(1024 * 1024, max_bytes - copied + 1))
-                        if not chunk:
-                            break
-                        copied += len(chunk)
-                        if copied > max_bytes:
-                            os._exit(2)
-                        destination.write(chunk)
-                    destination.flush()
-                    os.fsync(destination.fileno())
-                os._exit(0)
-            except BaseException:
-                os._exit(1)
         _wait_bounded_io_child(pid, deadline=deadline, operation="input staging")
     finally:
-        if fd is not None:
-            os.close(fd)
-        os.close(parent_fd)
         if not target.is_file():
             try:
                 target.unlink()
@@ -382,61 +405,75 @@ def _atomic_commit_output_to_scope(
     deadline: float,
 ) -> None:
     if not source.is_file():
-        raise WorkerExecutionError(
-            "worker completed without required staged output: {}".format(source)
-        )
+        raise WorkerExecutionError("worker completed without required staged output: {}".format(source))
     if max_bytes <= 0 or source.stat().st_size > max_bytes:
         raise ResourceDenied("output exceeds trusted publication byte limit: {}".format(relative))
     if time.monotonic() >= deadline:
         raise WorkerTimeout("output publication exceeded end-to-end deadline")
 
-    parent_fd, name = _open_parent_from_scope(scope_fd, relative, create_missing=True)
-    temp_name = ".{}.sunokiller-{}".format(name, uuid.uuid4().hex)
-    try:
-        pid = os.fork()
-        if pid == 0:
+    committed_read, committed_write = os.pipe()
+    os.set_blocking(committed_read, False)
+    pid = os.fork()
+    if pid == 0:
+        os.close(committed_read)
+        parent_fd = None
+        fd = None
+        temp_name = None
+        committed = False
+        try:
+            parent_fd, name = _open_parent_from_scope(scope_fd, relative, create_missing=True)
+            temp_name = ".{}.sunokiller-{}".format(name, uuid.uuid4().hex)
+            fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+            copied = 0
+            with source.open("rb") as staged, os.fdopen(os.dup(fd), "wb") as destination:
+                while True:
+                    chunk = staged.read(min(1024 * 1024, max_bytes - copied + 1))
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > max_bytes:
+                        os._exit(2)
+                    destination.write(chunk)
+                destination.flush()
+                os.fsync(destination.fileno())
+            os.close(fd)
             fd = None
+            os.replace(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            committed = True
+            os.write(committed_write, b"C")
             try:
-                fd = os.open(
-                    temp_name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=parent_fd,
-                )
-                copied = 0
-                with source.open("rb") as staged, os.fdopen(os.dup(fd), "wb") as destination:
-                    while True:
-                        chunk = staged.read(min(1024 * 1024, max_bytes - copied + 1))
-                        if not chunk:
-                            break
-                        copied += len(chunk)
-                        if copied > max_bytes:
-                            os._exit(2)
-                        destination.write(chunk)
-                    destination.flush()
-                    os.fsync(destination.fileno())
-                os.close(fd)
-                fd = None
-                os.replace(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except OSError:
+                pass
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+        finally:
+            if fd is not None:
                 try:
-                    os.fsync(parent_fd)
+                    os.close(fd)
                 except OSError:
                     pass
-                os._exit(0)
-            except BaseException:
-                if fd is not None:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                os._exit(1)
-        _wait_bounded_io_child(pid, deadline=deadline, operation="output publication")
+            if not committed and parent_fd is not None and temp_name is not None:
+                try:
+                    os.unlink(temp_name, dir_fd=parent_fd)
+                except OSError:
+                    pass
+            if parent_fd is not None:
+                try:
+                    os.close(parent_fd)
+                except OSError:
+                    pass
+            try:
+                os.close(committed_write)
+            except OSError:
+                pass
+    os.close(committed_write)
+    try:
+        _wait_bounded_io_child(pid, deadline=deadline, operation="output publication", committed_fd=committed_read)
     finally:
-        try:
-            os.unlink(temp_name, dir_fd=parent_fd)
-        except OSError:
-            pass
-        os.close(parent_fd)
+        os.close(committed_read)
+
 
 
 class _FilesystemStager:
