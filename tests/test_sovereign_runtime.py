@@ -648,6 +648,91 @@ class CapabilityBoundaryTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 1.0)
             self.assertFalse(target.exists())
 
+    @unittest.skipUnless(os.name == "posix", "bounded scope transfer uses POSIX descriptors")
+    def test_blocking_signed_scope_traversal_is_bounded(self):
+        real_open = os.open
+
+        def blocking_root_open(path, *args, **kwargs):
+            if path == "/":
+                time.sleep(5)
+            return real_open(path, *args, **kwargs)
+
+        started = time.monotonic()
+        with mock.patch.object(os, "open", blocking_root_open):
+            with self.assertRaises(WorkerTimeout):
+                _open_directory_bounded(
+                    Path("/authorized"),
+                    deadline=time.monotonic() + 0.1,
+                )
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
+    def test_input_timeout_does_not_probe_or_unlink_staging_target_in_parent(self):
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
+            root = Path(allowed).resolve()
+            (root / "in.wav").write_bytes(b"audio")
+            target = Path(staging) / "staged.wav"
+            scope_fd = _open_directory_no_symlinks(root)
+            real_open = Path.open
+            parent_pid = os.getpid()
+
+            def blocking_target_open(path, *args, **kwargs):
+                if Path(path) == target:
+                    time.sleep(5)
+                return real_open(path, *args, **kwargs)
+
+            def forbidden_parent_probe(path, *args, **kwargs):
+                if os.getpid() == parent_pid and Path(path) == target:
+                    raise AssertionError("staging target probed by parent")
+                return False
+
+            started = time.monotonic()
+            try:
+                with mock.patch.object(Path, "open", blocking_target_open), mock.patch.object(
+                    Path, "is_file", forbidden_parent_probe
+                ):
+                    with self.assertRaises(WorkerTimeout):
+                        _copy_regular_input_from_scope(
+                            scope_fd,
+                            Path("in.wav"),
+                            target,
+                            max_bytes=1024,
+                            deadline=time.monotonic() + 0.1,
+                        )
+            finally:
+                os.close(scope_fd)
+            self.assertLess(time.monotonic() - started, 1.0)
+
+    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
+    def test_blocking_staged_output_preflight_is_bounded(self):
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
+            root = Path(allowed).resolve()
+            source = Path(staging) / "master.wav"
+            source.write_bytes(b"master")
+            scope_fd = _open_directory_no_symlinks(root)
+            real_is_file = Path.is_file
+
+            def blocking_is_file(path):
+                if Path(path) == source:
+                    time.sleep(5)
+                return real_is_file(path)
+
+            started = time.monotonic()
+            try:
+                with mock.patch.object(Path, "is_file", blocking_is_file):
+                    with self.assertRaises(WorkerTimeout):
+                        _atomic_commit_output_to_scope(
+                            scope_fd,
+                            Path("out.wav"),
+                            source,
+                            max_bytes=1024,
+                            deadline=time.monotonic() + 0.1,
+                        )
+            finally:
+                os.close(scope_fd)
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertFalse((root / "out.wav").exists())
+
     @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
     def test_blocking_input_descriptor_preflight_is_bounded(self):
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
