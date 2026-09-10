@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import array
 import json
 import math
 import os
 from pathlib import Path
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -342,6 +344,55 @@ def _wait_bounded_io_child(
         time.sleep(0.01)
 
 
+def _open_directory_bounded(path: Path, *, deadline: float) -> int:
+    """Open a signed scope in a killable child and transfer only the verified fd."""
+    parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    pid = os.fork()
+    if pid == 0:
+        parent_sock.close()
+        fd = None
+        try:
+            fd = _open_directory_no_symlinks(path)
+            rights = array.array("i", [fd])
+            child_sock.sendmsg([b"F"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            child_sock.close()
+
+    child_sock.close()
+    parent_sock.setblocking(False)
+    try:
+        while True:
+            try:
+                data, ancdata, _, _ = parent_sock.recvmsg(1, socket.CMSG_SPACE(array.array("i").itemsize))
+                if data == b"F":
+                    for level, kind, payload in ancdata:
+                        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                            rights = array.array("i")
+                            rights.frombytes(payload[: rights.itemsize])
+                            received_fd = rights[0]
+                            _bounded_kill_and_reap(pid)
+                            return received_fd
+            except BlockingIOError:
+                pass
+            completed, status = os.waitpid(pid, os.WNOHANG)
+            if completed == pid:
+                raise ResourceDenied("descriptor-safe signed scope traversal failed")
+            if time.monotonic() >= deadline:
+                _bounded_kill_and_reap(pid)
+                raise WorkerTimeout("signed scope traversal exceeded end-to-end deadline")
+            time.sleep(0.01)
+    finally:
+        parent_sock.close()
+
+
 def _copy_regular_input_from_scope(
     scope_fd: int,
     relative: Path,
@@ -390,14 +441,7 @@ def _copy_regular_input_from_scope(
                     os.close(parent_fd)
                 except OSError:
                     pass
-    try:
-        _wait_bounded_io_child(pid, deadline=deadline, operation="input staging")
-    finally:
-        if not target.is_file():
-            try:
-                target.unlink()
-            except OSError:
-                pass
+    _wait_bounded_io_child(pid, deadline=deadline, operation="input staging")
 
 
 def _atomic_commit_output_to_scope(
@@ -408,10 +452,6 @@ def _atomic_commit_output_to_scope(
     max_bytes: int,
     deadline: float,
 ) -> None:
-    if not source.is_file():
-        raise WorkerExecutionError("worker completed without required staged output: {}".format(source))
-    if max_bytes <= 0 or source.stat().st_size > max_bytes:
-        raise ResourceDenied("output exceeds trusted publication byte limit: {}".format(relative))
     if time.monotonic() >= deadline:
         raise WorkerTimeout("output publication exceeded end-to-end deadline")
 
@@ -425,6 +465,11 @@ def _atomic_commit_output_to_scope(
         temp_name = None
         committed = False
         try:
+            if not source.is_file():
+                os._exit(4)
+            source_size = source.stat().st_size
+            if max_bytes <= 0 or source_size > max_bytes:
+                os._exit(2)
             parent_fd, name = _open_parent_from_scope(scope_fd, relative, create_missing=True)
             temp_name = ".{}.sunokiller-{}".format(name, uuid.uuid4().hex)
             fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
@@ -524,7 +569,7 @@ class _FilesystemStager:
                         "payload resource field {} must be a non-empty path string".format(field)
                     )
                 scope, relative = _select_signed_filesystem_scope(self.lease, raw)
-                scope_fd = _open_directory_no_symlinks(scope)
+                scope_fd = _open_directory_bounded(scope, deadline=self._deadline)
                 self._scope_fds.append(scope_fd)
                 suffix = Path(raw).suffix
                 staged = self._root / "input-{}{}".format(index, suffix)
@@ -545,7 +590,7 @@ class _FilesystemStager:
                         "payload resource field {} must be a non-empty path string".format(field)
                     )
                 scope, relative = _select_signed_filesystem_scope(self.lease, raw)
-                scope_fd = _open_directory_no_symlinks(scope)
+                scope_fd = _open_directory_bounded(scope, deadline=self._deadline)
                 self._scope_fds.append(scope_fd)
                 suffix = Path(raw).suffix
                 staged = self._root / "output-{}{}".format(index, suffix)
