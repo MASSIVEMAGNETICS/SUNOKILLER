@@ -26,7 +26,7 @@ from .contracts import (
     ResourceDenied,
     digest_json,
 )
-from .state import NO_SNAPSHOT_PRECONDITION, SQLiteStateStore
+from .state import NO_SNAPSHOT_PRECONDITION, SQLiteStateStore, StateDeadlineExceeded
 
 
 class WorkerExecutionError(RuntimeError):
@@ -393,37 +393,78 @@ def _open_directory_bounded(path: Path, *, deadline: float) -> int:
         parent_sock.close()
 
 
-def _make_private_staging_directory_bounded(*, deadline: float) -> Path:
-    """Create the private staging root without blocking the lease-holding parent."""
+def _make_private_staging_directory_bounded(
+    *,
+    deadline: float,
+) -> Tuple[int, int, str]:
+    """Create staging in a child and retain verified parent/root descriptors."""
     parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
     pid = os.fork()
     if pid == 0:
         parent_sock.close()
+        parent_fd = None
+        root_fd = None
         try:
-            created = tempfile.mkdtemp(prefix="sunokiller-runtime-")
-            payload = b"P" + os.fsencode(created)
-            if len(payload) > 4096:
+            created = Path(tempfile.mkdtemp(prefix="sunokiller-runtime-"))
+            parent_fd = _open_directory_no_symlinks(created.parent)
+            root_fd = os.open(
+                created.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            info = os.fstat(root_fd)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) & 0o077
+            ):
+                os._exit(3)
+            name_bytes = os.fsencode(created.name)
+            if not name_bytes or len(name_bytes) > 255:
                 os._exit(2)
-            child_sock.send(payload)
+            rights = array.array("i", [parent_fd, root_fd])
+            child_sock.sendmsg(
+                [b"D" + name_bytes],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+            )
             os._exit(0)
         except BaseException:
             os._exit(1)
 
     child_sock.close()
     parent_sock.setblocking(False)
+    control_size = socket.CMSG_SPACE(2 * array.array("i").itemsize)
     try:
         while True:
             try:
-                payload = parent_sock.recv(4096)
-                if payload[:1] == b"P" and len(payload) > 1:
-                    _bounded_kill_and_reap(pid)
-                    return Path(os.fsdecode(payload[1:]))
+                data, ancdata, _, _ = parent_sock.recvmsg(256, control_size)
+                if data[:1] == b"D":
+                    received = []
+                    for level, kind, payload in ancdata:
+                        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                            rights = array.array("i")
+                            usable = len(payload) - (len(payload) % rights.itemsize)
+                            rights.frombytes(payload[:usable])
+                            received.extend(rights.tolist())
+                    name = os.fsdecode(data[1:])
+                    if len(received) >= 2 and name not in ("", ".", "..") and "/" not in name:
+                        _bounded_kill_and_reap(pid)
+                        for extra_fd in received[2:]:
+                            os.close(extra_fd)
+                        return received[0], received[1], name
+                    for received_fd in received:
+                        os.close(received_fd)
+                    raise WorkerExecutionError(
+                        "private staging descriptor transfer was invalid"
+                    )
             except BlockingIOError:
                 pass
             completed, status = os.waitpid(pid, os.WNOHANG)
             if completed == pid:
                 if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2:
-                    raise WorkerExecutionError("private staging path exceeded transport limit")
+                    raise WorkerExecutionError("private staging name exceeded transport limit")
+                if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 3:
+                    raise ResourceDenied("private staging directory permissions were unsafe")
                 raise WorkerExecutionError("private staging directory creation failed")
             if time.monotonic() >= deadline:
                 _bounded_kill_and_reap(pid)
@@ -435,12 +476,29 @@ def _make_private_staging_directory_bounded(*, deadline: float) -> Path:
         parent_sock.close()
 
 
-def _remove_private_staging_directory_bounded(path: Path) -> None:
-    """Best-effort bounded cleanup; never block Human STOP in the parent."""
+def _remove_private_staging_directory_bounded(
+    parent_fd: int,
+    root_fd: int,
+    name: str,
+) -> None:
+    """Erase staged files by descriptor and remove only the same directory inode."""
     pid = os.fork()
     if pid == 0:
         try:
-            shutil.rmtree(path, ignore_errors=True)
+            for entry in os.listdir(root_fd):
+                info = os.stat(entry, dir_fd=root_fd, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    os.rmdir(entry, dir_fd=root_fd)
+                else:
+                    os.unlink(entry, dir_fd=root_fd)
+            root_info = os.fstat(root_fd)
+            entry_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                stat.S_ISDIR(entry_info.st_mode)
+                and root_info.st_dev == entry_info.st_dev
+                and root_info.st_ino == entry_info.st_ino
+            ):
+                os.rmdir(name, dir_fd=parent_fd)
             os._exit(0)
         except BaseException:
             os._exit(1)
@@ -452,9 +510,14 @@ def _remove_private_staging_directory_bounded(path: Path) -> None:
             operation="private staging cleanup",
         )
     except WorkerExecutionError:
-        # Cleanup cannot restore a failed execution or delay Human STOP. The
-        # staging directory is private and public publication stays disabled.
+        # Staged file erasure is attempted through the retained root descriptor.
+        # Cleanup failure cannot delay Human STOP or enable public publication.
         pass
+
+
+def _staging_descriptor_path(root_fd: int, name: str) -> str:
+    base = "/proc/self/fd" if sys.platform.startswith("linux") else "/dev/fd"
+    return "{}/{}/{}".format(base, root_fd, name)
 
 
 def _copy_regular_input_from_scope(
@@ -462,6 +525,7 @@ def _copy_regular_input_from_scope(
     relative: Path,
     target: Path,
     *,
+    target_dir_fd: Optional[int] = None,
     max_bytes: int,
     deadline: float,
 ) -> None:
@@ -478,7 +542,17 @@ def _copy_regular_input_from_scope(
             if max_bytes <= 0 or info.st_size > max_bytes:
                 os._exit(2)
             copied = 0
-            with os.fdopen(os.dup(fd), "rb") as source, target.open("wb") as destination:
+            if target_dir_fd is None:
+                destination_context = target.open("wb")
+            else:
+                destination_fd = os.open(
+                    target.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=target_dir_fd,
+                )
+                destination_context = os.fdopen(destination_fd, "wb")
+            with os.fdopen(os.dup(fd), "rb") as source, destination_context as destination:
                 while True:
                     chunk = source.read(min(1024 * 1024, max_bytes - copied + 1))
                     if not chunk:
@@ -553,7 +627,9 @@ class _FilesystemStager:
         self.policy = policy
         self.original_payload = dict(payload)
         self.execution_payload = dict(payload)
-        self._root = None
+        self._root_parent_fd = None
+        self._root_fd = None
+        self._root_name = None
         self._scope_fds = []
         self._output_commits = []
         self._public_path_map = {}
@@ -564,7 +640,11 @@ class _FilesystemStager:
             return self
 
         _require_posix_descriptor_containment()
-        self._root = _make_private_staging_directory_bounded(deadline=self._deadline)
+        (
+            self._root_parent_fd,
+            self._root_fd,
+            self._root_name,
+        ) = _make_private_staging_directory_bounded(deadline=self._deadline)
 
         try:
             for index, field in enumerate(self.policy.filesystem_inputs):
@@ -577,16 +657,19 @@ class _FilesystemStager:
                 scope_fd = _open_directory_bounded(scope, deadline=self._deadline)
                 self._scope_fds.append(scope_fd)
                 suffix = Path(raw).suffix
-                staged = self._root / "input-{}{}".format(index, suffix)
+                staged_name = "input-{}{}".format(index, suffix)
+                staged = Path(staged_name)
                 _copy_regular_input_from_scope(
                     scope_fd,
                     relative,
                     staged,
+                    target_dir_fd=self._root_fd,
                     max_bytes=self.policy.max_input_bytes,
                     deadline=self._deadline,
                 )
-                self.execution_payload[field] = str(staged)
-                self._public_path_map[str(staged)] = str(_normalized_absolute_path(raw))
+                staged_path = _staging_descriptor_path(self._root_fd, staged_name)
+                self.execution_payload[field] = staged_path
+                self._public_path_map[staged_path] = str(_normalized_absolute_path(raw))
 
             for index, field in enumerate(self.policy.filesystem_outputs):
                 raw = self.original_payload.get(field)
@@ -598,10 +681,13 @@ class _FilesystemStager:
                 scope_fd = _open_directory_bounded(scope, deadline=self._deadline)
                 self._scope_fds.append(scope_fd)
                 suffix = Path(raw).suffix
-                staged = self._root / "output-{}{}".format(index, suffix)
-                self.execution_payload[field] = str(staged)
-                self._output_commits.append((scope_fd, relative, staged))
-                self._public_path_map[str(staged)] = str(_normalized_absolute_path(raw))
+                staged_name = "output-{}{}".format(index, suffix)
+                staged_path = _staging_descriptor_path(self._root_fd, staged_name)
+                self.execution_payload[field] = staged_path
+                self._output_commits.append((scope_fd, relative, Path(staged_path)))
+                self._public_path_map[staged_path] = str(_normalized_absolute_path(raw))
+
+            self.execution_payload["_descriptor_staging_fds"] = [self._root_fd]
         except OSError as exc:
             self._cleanup()
             raise ResourceDenied("descriptor-safe path authorization failed") from exc
@@ -623,6 +709,10 @@ class _FilesystemStager:
                 deadline=self._deadline,
             )
 
+    @property
+    def pass_fds(self) -> Tuple[int, ...]:
+        return (self._root_fd,) if self._root_fd is not None else ()
+
     def restore_public_paths(self, result: Dict[str, Any]) -> Dict[str, Any]:
         restored = dict(result)
         for key, value in tuple(restored.items()):
@@ -637,9 +727,25 @@ class _FilesystemStager:
             except OSError:
                 pass
         self._scope_fds.clear()
-        if self._root is not None:
-            _remove_private_staging_directory_bounded(self._root)
-            self._root = None
+        if (
+            self._root_parent_fd is not None
+            and self._root_fd is not None
+            and self._root_name is not None
+        ):
+            _remove_private_staging_directory_bounded(
+                self._root_parent_fd,
+                self._root_fd,
+                self._root_name,
+            )
+        for fd in (self._root_fd, self._root_parent_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self._root_parent_fd = None
+        self._root_fd = None
+        self._root_name = None
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self._cleanup()
@@ -747,8 +853,10 @@ class IsolatedRunner:
         lease: CapabilityLease,
         worker: WorkerSpec,
         payload: Mapping[str, Any],
+        policy: Optional[WorkerPolicy] = None,
+        deadline: Optional[float] = None,
     ) -> WorkerPolicy:
-        policy = self._policy_for(worker)
+        policy = policy or self._policy_for(worker)
         if lease.subject != policy.worker_id:
             raise WorkerExecutionError(
                 "signed lease subject {} does not authorize worker {}".format(
@@ -756,7 +864,14 @@ class IsolatedRunner:
                 )
             )
 
-        revoked_ids = self.state_store.revoked_ids()
+        try:
+            revoked_ids = self.state_store.revoked_ids(
+                deadline_monotonic=deadline,
+            )
+        except StateDeadlineExceeded as exc:
+            raise WorkerTimeout(
+                "end-to-end execution deadline expired during authority check"
+            ) from exc
         self.authority.verify_lease(
             lease,
             required_capability=policy.capability,
@@ -780,6 +895,7 @@ class IsolatedRunner:
         worker: WorkerSpec,
         envelope: Mapping[str, Any],
         limits: Mapping[str, Any],
+        pass_fds: Tuple[int, ...] = (),
     ) -> Tuple[int, str, str]:
         args = list(_isolated_worker_command())
         kwargs: Dict[str, Any] = {
@@ -791,6 +907,8 @@ class IsolatedRunner:
         }
 
         if os.name == "posix":
+            if pass_fds:
+                kwargs["pass_fds"] = pass_fds
             # start_new_session is implemented by subprocess without running a
             # Python preexec callback. Resource limits are applied after exec in
             # the trusted worker_entry process, avoiding fork-time deadlocks.
@@ -833,18 +951,29 @@ class IsolatedRunner:
         payload: Mapping[str, Any],
     ) -> Tuple[Dict[str, Any], ExecutionReceipt]:
         input_payload = dict(payload)
+        policy = self._policy_for(worker)
+        limits = self._validated_limits(worker, policy)
+        started = int(time.time())
+        input_hash = digest_json(input_payload)
+        deadline = time.monotonic() + float(limits["timeout_seconds"])
+
         policy = self._verify_worker_and_resources(
             lease=lease,
             worker=worker,
             payload=input_payload,
+            policy=policy,
+            deadline=deadline,
         )
-        limits = self._validated_limits(worker, policy)
-
-        pre = self.state_store.load_latest(self.state_key)
+        try:
+            pre = self.state_store.load_latest(
+                self.state_key,
+                deadline_monotonic=deadline,
+            )
+        except StateDeadlineExceeded as exc:
+            raise WorkerTimeout(
+                "end-to-end execution deadline expired while loading state"
+            ) from exc
         pre_hash = pre.state_hash if pre else digest_json({})
-        started = int(time.time())
-        input_hash = digest_json(input_payload)
-        deadline = time.monotonic() + float(limits["timeout_seconds"])
 
         with _FilesystemStager(
             lease=lease,
@@ -885,6 +1014,7 @@ class IsolatedRunner:
                 worker=worker,
                 envelope=envelope,
                 limits=worker_limits,
+                pass_fds=stager.pass_fds,
             )
 
             if returncode != 0:
@@ -906,6 +1036,8 @@ class IsolatedRunner:
                 lease=lease,
                 worker=worker,
                 payload=input_payload,
+                policy=policy,
+                deadline=deadline,
             )
             self._validated_limits(worker, policy)
 
@@ -919,11 +1051,17 @@ class IsolatedRunner:
             # before publication (and blocks it) or after the authorized file
             # replacement has fully completed.
             if policy.filesystem_outputs and not input_payload.get("dry_run"):
-                with self.state_store.lease_commit_guard(
-                    lease.lease_id,
-                    expires_at=lease.expires_at,
-                ):
-                    stager.commit_outputs()
+                try:
+                    with self.state_store.lease_commit_guard(
+                        lease.lease_id,
+                        expires_at=lease.expires_at,
+                        deadline_monotonic=deadline,
+                    ):
+                        stager.commit_outputs()
+                except StateDeadlineExceeded as exc:
+                    raise WorkerTimeout(
+                        "end-to-end execution deadline expired during output commit"
+                    ) from exc
                 output_commit_linearized = True
             else:
                 stager.commit_outputs()
@@ -934,21 +1072,33 @@ class IsolatedRunner:
             if proposed_state is not None:
                 if not isinstance(proposed_state, dict):
                     raise WorkerExecutionError("_state must be a dict")
-                snapshot = self.state_store.save_snapshot(
-                    self.state_key,
-                    proposed_state,
-                    expected_hash=pre.state_hash if pre else NO_SNAPSHOT_PRECONDITION,
-                    lease_id=lease.lease_id,
-                    lease_expires_at=lease.expires_at,
-                )
+                try:
+                    snapshot = self.state_store.save_snapshot(
+                        self.state_key,
+                        proposed_state,
+                        expected_hash=pre.state_hash if pre else NO_SNAPSHOT_PRECONDITION,
+                        lease_id=lease.lease_id,
+                        lease_expires_at=lease.expires_at,
+                        deadline_monotonic=deadline,
+                    )
+                except StateDeadlineExceeded as exc:
+                    raise WorkerTimeout(
+                        "end-to-end execution deadline expired during state commit"
+                    ) from exc
                 post_hash = snapshot.state_hash
             elif not output_commit_linearized:
                 # Stateless/no-side-effect work still needs one final durable
                 # authority check before its successful receipt is issued.
-                self.state_store.assert_lease_active(
-                    lease.lease_id,
-                    expires_at=lease.expires_at,
-                )
+                try:
+                    self.state_store.assert_lease_active(
+                        lease.lease_id,
+                        expires_at=lease.expires_at,
+                        deadline_monotonic=deadline,
+                    )
+                except StateDeadlineExceeded as exc:
+                    raise WorkerTimeout(
+                        "end-to-end execution deadline expired during final authority check"
+                    ) from exc
 
         finished = int(time.time())
         receipt = ExecutionReceipt(
