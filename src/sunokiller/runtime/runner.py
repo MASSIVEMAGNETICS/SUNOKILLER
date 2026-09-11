@@ -472,8 +472,9 @@ class _FilesystemStager:
 
     The worker and FFmpeg never receive caller-controlled authorized paths.
     Inputs are copied from no-follow descriptors into a private staging
-    directory. Outputs are produced only in staging and atomically committed
-    through a directory fd retained from the signed scope.
+    directory. Outputs are produced only in staging; bounded v0.1 refuses
+    caller-visible publication until a durable receipt-linked transaction
+    replaces the disabled commit boundary.
     """
 
     def __init__(
