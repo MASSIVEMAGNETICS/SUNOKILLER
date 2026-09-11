@@ -11,10 +11,12 @@ from __future__ import annotations
 import argparse
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Any, Dict, List
+import sys
+from typing import Any, Dict, List, Tuple
 
 
 class OmenError(RuntimeError):
@@ -92,14 +94,35 @@ def master_file(
     timeout_seconds: int = 900,
     dry_run: bool = False,
     ffmpeg_path: str | None = None,
+    descriptor_staging_fds: Tuple[int, ...] = (),
 ) -> Dict[str, Any]:
     _require_master_sample_rate(sample_rate)
-    source = Path(input_path).expanduser().resolve()
-    target = Path(output_path).expanduser().resolve()
+    staging_fds = tuple(int(fd) for fd in descriptor_staging_fds)
+    if any(fd < 0 for fd in staging_fds):
+        raise OmenError("descriptor staging fds must be non-negative")
+
+    if staging_fds:
+        source = Path(input_path)
+        target = Path(output_path)
+        allowed_prefixes = tuple(
+            "{}/{}/".format(
+                "/proc/self/fd" if sys.platform.startswith("linux") else "/dev/fd",
+                fd,
+            )
+            for fd in staging_fds
+        )
+        if not any(str(source).startswith(prefix) for prefix in allowed_prefixes):
+            raise OmenError("descriptor-staged input path is not bound to a retained fd")
+        if not any(str(target).startswith(prefix) for prefix in allowed_prefixes):
+            raise OmenError("descriptor-staged output path is not bound to a retained fd")
+    else:
+        source = Path(input_path).expanduser().resolve()
+        target = Path(output_path).expanduser().resolve()
 
     if not source.is_file():
         raise OmenError("input does not exist: {}".format(source))
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        target.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = build_master_command(
         input_path=str(source),
@@ -130,7 +153,10 @@ def master_file(
     if not executable.is_absolute() or executable.is_symlink() or not executable.is_file():
         raise OmenError("ffmpeg executable must be a pinned absolute regular file")
 
-    subprocess.run(cmd, check=True, timeout=timeout_seconds)
+    run_kwargs = {}
+    if staging_fds and os.name == "posix":
+        run_kwargs["pass_fds"] = staging_fds
+    subprocess.run(cmd, check=True, timeout=timeout_seconds, **run_kwargs)
     if not target.is_file() or target.stat().st_size == 0:
         raise OmenError("ffmpeg completed without a usable output")
 
@@ -159,6 +185,7 @@ def mastering_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
         timeout_seconds=int(payload.get("timeout_seconds", 900)),
         dry_run=bool(payload.get("dry_run", False)),
         ffmpeg_path=payload.get("_trusted_ffmpeg_path"),
+        descriptor_staging_fds=tuple(payload.get("_descriptor_staging_fds", ())),
     )
 
 
