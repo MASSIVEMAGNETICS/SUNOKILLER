@@ -452,76 +452,18 @@ def _atomic_commit_output_to_scope(
     max_bytes: int,
     deadline: float,
 ) -> None:
-    if time.monotonic() >= deadline:
-        raise WorkerTimeout("output publication exceeded end-to-end deadline")
+    """Fail closed until visibility and receipt commit share one durable transaction.
 
-    committed_read, committed_write = os.pipe()
-    os.set_blocking(committed_read, False)
-    pid = os.fork()
-    if pid == 0:
-        os.close(committed_read)
-        parent_fd = None
-        fd = None
-        temp_name = None
-        committed = False
-        try:
-            if not source.is_file():
-                os._exit(4)
-            source_size = source.stat().st_size
-            if max_bytes <= 0 or source_size > max_bytes:
-                os._exit(2)
-            parent_fd, name = _open_parent_from_scope(scope_fd, relative, create_missing=True)
-            temp_name = ".{}.sunokiller-{}".format(name, uuid.uuid4().hex)
-            fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
-            copied = 0
-            with source.open("rb") as staged, os.fdopen(os.dup(fd), "wb") as destination:
-                while True:
-                    chunk = staged.read(min(1024 * 1024, max_bytes - copied + 1))
-                    if not chunk:
-                        break
-                    copied += len(chunk)
-                    if copied > max_bytes:
-                        os._exit(2)
-                    destination.write(chunk)
-                destination.flush()
-                os.fsync(destination.fileno())
-            os.close(fd)
-            fd = None
-            os.replace(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-            committed = True
-            os.write(committed_write, b"C")
-            try:
-                os.fsync(parent_fd)
-            except OSError:
-                pass
-            os._exit(0)
-        except BaseException:
-            os._exit(1)
-        finally:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            if not committed and parent_fd is not None and temp_name is not None:
-                try:
-                    os.unlink(temp_name, dir_fd=parent_fd)
-                except OSError:
-                    pass
-            if parent_fd is not None:
-                try:
-                    os.close(parent_fd)
-                except OSError:
-                    pass
-            try:
-                os.close(committed_write)
-            except OSError:
-                pass
-    os.close(committed_write)
-    try:
-        _wait_bounded_io_child(pid, deadline=deadline, operation="output publication", committed_fd=committed_read)
-    finally:
-        os.close(committed_read)
+    POSIX rename and parent acknowledgment cannot be made atomic across process
+    preemption. Publishing here could therefore expose an output without a
+    matching success receipt. The bounded v0.1 runtime intentionally refuses
+    public output publication instead of overstating transactional safety.
+    """
+    del scope_fd, relative, source, max_bytes, deadline
+    raise WorkerExecutionError(
+        "public output publication is disabled until a durable receipt-linked "
+        "transaction is implemented"
+    )
 
 
 
