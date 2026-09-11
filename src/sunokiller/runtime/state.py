@@ -17,6 +17,10 @@ class StateConflict(RuntimeError):
     pass
 
 
+class StateDeadlineExceeded(RuntimeError):
+    pass
+
+
 # Optimistic-concurrency sentinel meaning: this write is valid only if the
 # state key has never had a snapshot. This is intentionally not a hash value.
 NO_SNAPSHOT_PRECONDITION = "__NO_SNAPSHOT__"
@@ -59,12 +63,83 @@ class SQLiteStateStore:
             """
         )
 
+    @staticmethod
+    def _assert_deadline(deadline_monotonic: Optional[float]) -> None:
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise StateDeadlineExceeded("state operation exceeded end-to-end deadline")
+
+    @contextmanager
+    def _locked_until(
+        self,
+        deadline_monotonic: Optional[float],
+    ) -> Iterator[None]:
+        if deadline_monotonic is None:
+            self._lock.acquire()
+        else:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0 or not self._lock.acquire(timeout=remaining):
+                raise StateDeadlineExceeded(
+                    "state operation could not acquire the in-process lock before deadline"
+                )
+        try:
+            self._assert_deadline(deadline_monotonic)
+            yield
+        finally:
+            self._lock.release()
+
+    @contextmanager
+    def _immediate_transaction(
+        self,
+        deadline_monotonic: Optional[float],
+    ) -> Iterator[None]:
+        previous_timeout = int(self._conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        began = False
+        if deadline_monotonic is not None:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise StateDeadlineExceeded(
+                    "state transaction deadline expired before lock acquisition"
+                )
+            self._conn.execute(
+                "PRAGMA busy_timeout = {}".format(max(1, int(remaining * 1000)))
+            )
+        try:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                began = True
+            except sqlite3.OperationalError as exc:
+                if deadline_monotonic is not None and (
+                    time.monotonic() >= deadline_monotonic
+                    or "locked" in str(exc).lower()
+                    or "busy" in str(exc).lower()
+                ):
+                    raise StateDeadlineExceeded(
+                        "state transaction could not acquire the SQLite write lock before deadline"
+                    ) from exc
+                raise
+            self._assert_deadline(deadline_monotonic)
+            yield
+            self._assert_deadline(deadline_monotonic)
+            self._conn.execute("COMMIT")
+            began = False
+        except Exception:
+            if began:
+                self._conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._conn.execute("PRAGMA busy_timeout = {}".format(previous_timeout))
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
 
-    def load_latest(self, key: str) -> Optional[StateSnapshot]:
-        with self._lock:
+    def load_latest(
+        self,
+        key: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Optional[StateSnapshot]:
+        with self._locked_until(deadline_monotonic):
             row = self._conn.execute(
                 """
                 SELECT key, version, state_json, state_hash, created_at
@@ -112,9 +187,10 @@ class SQLiteStateStore:
         lease_id: str,
         *,
         expires_at: Optional[int] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> None:
         """Fail if revocation/expiry is already durable at this instant."""
-        with self._lock:
+        with self._locked_until(deadline_monotonic):
             self._assert_lease_active_locked(lease_id, expires_at=expires_at)
 
     @contextmanager
@@ -123,6 +199,7 @@ class SQLiteStateStore:
         lease_id: str,
         *,
         expires_at: Optional[int] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> Iterator[None]:
         """Linearize one bounded external side effect against STOP/revocation.
 
@@ -134,15 +211,10 @@ class SQLiteStateStore:
         operations such as atomically publishing a staged output file; long
         worker execution must never run inside this guard.
         """
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
+        with self._locked_until(deadline_monotonic):
+            with self._immediate_transaction(deadline_monotonic):
                 self._assert_lease_active_locked(lease_id, expires_at=expires_at)
                 yield
-                self._conn.execute("COMMIT")
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
 
     def save_snapshot(
         self,
@@ -152,6 +224,7 @@ class SQLiteStateStore:
         expected_hash: Optional[str] = None,
         lease_id: Optional[str] = None,
         lease_expires_at: Optional[int] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> StateSnapshot:
         """Commit state with optimistic concurrency and an atomic lease gate.
 
@@ -165,9 +238,8 @@ class SQLiteStateStore:
         state_json = canonical_json(payload)
         state_hash = digest_json(payload)
 
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
+        with self._locked_until(deadline_monotonic):
+            with self._immediate_transaction(deadline_monotonic):
                 if lease_id is not None:
                     self._assert_lease_active_locked(
                         lease_id,
@@ -210,10 +282,6 @@ class SQLiteStateStore:
                     """,
                     (key, new_version, state_json, state_hash, created_at),
                 )
-                self._conn.execute("COMMIT")
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
 
         return StateSnapshot(
             key=key,
@@ -244,11 +312,20 @@ class SQLiteStateStore:
                 self._conn.execute("ROLLBACK")
                 raise
 
-    def is_revoked(self, lease_id: str) -> bool:
-        with self._lock:
+    def is_revoked(
+        self,
+        lease_id: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        with self._locked_until(deadline_monotonic):
             return self._lease_is_revoked_locked(lease_id)
 
-    def revoked_ids(self) -> Set[str]:
-        with self._lock:
+    def revoked_ids(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Set[str]:
+        with self._locked_until(deadline_monotonic):
             rows = self._conn.execute("SELECT lease_id FROM lease_revocations").fetchall()
         return {row[0] for row in rows}
