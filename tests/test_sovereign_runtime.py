@@ -543,17 +543,18 @@ class CapabilityBoundaryTests(unittest.TestCase):
                     capabilities=["audio.master"],
                     resource_scopes=["catalog/masters", str(root)],
                 )
-                result, receipt = runner.execute(
-                    lease=lease,
-                    worker=self.omen_worker(),
-                    payload={"input_path": str(source), "output_path": str(output)},
-                )
+                with self.assertRaisesRegex(
+                    WorkerExecutionError, "durable receipt-linked transaction"
+                ):
+                    runner.execute(
+                        lease=lease,
+                        worker=self.omen_worker(),
+                        payload={"input_path": str(source), "output_path": str(output)},
+                    )
             finally:
                 os.environ["PATH"] = old_path
-            self.assertEqual(result["status"], "MASTERED")
-            self.assertEqual(output.read_bytes(), b"mastered")
+            self.assertFalse(output.exists())
             self.assertFalse(marker.exists())
-            self.authority.verify_receipt(receipt)
 
     @unittest.skipUnless(os.name == "posix", "descriptor-safe filesystem broker is POSIX v0.1")
     def test_input_staging_enforces_trusted_byte_limit(self):
@@ -618,221 +619,52 @@ class CapabilityBoundaryTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 1.0)
             self.assertFalse(target.exists())
 
-    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
-    def test_blocking_output_publication_cannot_block_human_stop_boundary(self):
-        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
-            root = Path(allowed).resolve()
-            source = Path(staging) / "master.wav"
-            source.write_bytes(b"master")
-            target = root / "out.wav"
-            scope_fd = _open_directory_no_symlinks(root)
-            real_open = Path.open
-
-            def blocking_open(path, *args, **kwargs):
-                if Path(path) == source:
-                    time.sleep(5)
-                return real_open(path, *args, **kwargs)
-
-            started = time.monotonic()
-            try:
-                with mock.patch.object(Path, "open", blocking_open):
-                    with self.assertRaises(WorkerTimeout):
-                        _atomic_commit_output_to_scope(
-                            scope_fd,
-                            Path("out.wav"),
-                            source,
-                            max_bytes=1024,
-                            deadline=time.monotonic() + 0.1,
-                        )
-            finally:
-                os.close(scope_fd)
-            self.assertLess(time.monotonic() - started, 1.0)
-            self.assertFalse(target.exists())
-
-    @unittest.skipUnless(os.name == "posix", "bounded scope transfer uses POSIX descriptors")
-    def test_blocking_signed_scope_traversal_is_bounded(self):
-        real_open = os.open
-
-        def blocking_root_open(path, *args, **kwargs):
-            if path == "/":
-                time.sleep(5)
-            return real_open(path, *args, **kwargs)
-
-        started = time.monotonic()
-        with mock.patch.object(os, "open", blocking_root_open):
-            with self.assertRaises(WorkerTimeout):
-                _open_directory_bounded(
-                    Path("/authorized"),
-                    deadline=time.monotonic() + 0.1,
-                )
-        self.assertLess(time.monotonic() - started, 1.0)
-
-    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
-    def test_input_timeout_does_not_probe_or_unlink_staging_target_in_parent(self):
-        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
-            root = Path(allowed).resolve()
-            (root / "in.wav").write_bytes(b"audio")
-            target = Path(staging) / "staged.wav"
-            scope_fd = _open_directory_no_symlinks(root)
-            real_open = Path.open
-            parent_pid = os.getpid()
-
-            def blocking_target_open(path, *args, **kwargs):
-                if Path(path) == target:
-                    time.sleep(5)
-                return real_open(path, *args, **kwargs)
-
-            def forbidden_parent_probe(path, *args, **kwargs):
-                if os.getpid() == parent_pid and Path(path) == target:
-                    raise AssertionError("staging target probed by parent")
-                return False
-
-            started = time.monotonic()
-            try:
-                with mock.patch.object(Path, "open", blocking_target_open), mock.patch.object(
-                    Path, "is_file", forbidden_parent_probe
-                ):
-                    with self.assertRaises(WorkerTimeout):
-                        _copy_regular_input_from_scope(
-                            scope_fd,
-                            Path("in.wav"),
-                            target,
-                            max_bytes=1024,
-                            deadline=time.monotonic() + 0.1,
-                        )
-            finally:
-                os.close(scope_fd)
-            self.assertLess(time.monotonic() - started, 1.0)
-
-    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
-    def test_blocking_staged_output_preflight_is_bounded(self):
-        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
-            root = Path(allowed).resolve()
-            source = Path(staging) / "master.wav"
-            source.write_bytes(b"master")
-            scope_fd = _open_directory_no_symlinks(root)
-            real_is_file = Path.is_file
-
-            def blocking_is_file(path):
-                if Path(path) == source:
-                    time.sleep(5)
-                return real_is_file(path)
-
-            started = time.monotonic()
-            try:
-                with mock.patch.object(Path, "is_file", blocking_is_file):
-                    with self.assertRaises(WorkerTimeout):
-                        _atomic_commit_output_to_scope(
-                            scope_fd,
-                            Path("out.wav"),
-                            source,
-                            max_bytes=1024,
-                            deadline=time.monotonic() + 0.1,
-                        )
-            finally:
-                os.close(scope_fd)
-            self.assertLess(time.monotonic() - started, 1.0)
-            self.assertFalse((root / "out.wav").exists())
-
-    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
-    def test_blocking_input_descriptor_preflight_is_bounded(self):
-        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
-            root = Path(allowed).resolve()
-            source = root / "in.wav"
-            source.write_bytes(b"audio")
-            target = Path(staging) / "staged.wav"
-            scope_fd = _open_directory_no_symlinks(root)
-            real_open = os.open
-
-            def blocking_open(path, *args, **kwargs):
-                if path == "in.wav" and kwargs.get("dir_fd") is not None:
-                    time.sleep(5)
-                return real_open(path, *args, **kwargs)
-
-            started = time.monotonic()
-            try:
-                with mock.patch.object(os, "open", blocking_open):
-                    with self.assertRaises(WorkerTimeout):
-                        _copy_regular_input_from_scope(
-                            scope_fd,
-                            Path("in.wav"),
-                            target,
-                            max_bytes=1024,
-                            deadline=time.monotonic() + 0.1,
-                        )
-            finally:
-                os.close(scope_fd)
-            self.assertLess(time.monotonic() - started, 1.0)
-
-    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
-    def test_timeout_cleanup_never_runs_on_lease_holding_parent(self):
-        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
-            root = Path(allowed).resolve()
-            source = Path(staging) / "master.wav"
-            source.write_bytes(b"master")
-            scope_fd = _open_directory_no_symlinks(root)
-            real_open = os.open
-            real_unlink = os.unlink
-
-            def blocking_open(path, *args, **kwargs):
-                if isinstance(path, str) and path.startswith(".out.wav.sunokiller-"):
-                    time.sleep(5)
-                return real_open(path, *args, **kwargs)
-
-            def forbidden_parent_unlink(*args, **kwargs):
-                if os.getpid() == parent_pid:
-                    raise AssertionError("authorized-filesystem cleanup ran in parent")
-                return real_unlink(*args, **kwargs)
-
-            parent_pid = os.getpid()
-            started = time.monotonic()
-            try:
-                with mock.patch.object(os, "open", blocking_open), mock.patch.object(
-                    os, "unlink", forbidden_parent_unlink
-                ):
-                    with self.assertRaises(WorkerTimeout):
-                        _atomic_commit_output_to_scope(
-                            scope_fd,
-                            Path("out.wav"),
-                            source,
-                            max_bytes=1024,
-                            deadline=time.monotonic() + 0.1,
-                        )
-            finally:
-                os.close(scope_fd)
-            self.assertLess(time.monotonic() - started, 1.0)
-            self.assertFalse((root / "out.wav").exists())
-
-    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
-    def test_visible_replace_is_success_even_if_directory_fsync_stalls(self):
+    @unittest.skipUnless(os.name == "posix", "public publication boundary is POSIX v0.1")
+    def test_publication_fails_closed_without_visible_output_or_receipt(self):
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
             root = Path(allowed).resolve()
             source = Path(staging) / "master.wav"
             source.write_bytes(b"master")
             output = root / "out.wav"
-            output.write_bytes(b"old")
             scope_fd = _open_directory_no_symlinks(root)
-            real_fsync = os.fsync
-
-            def blocking_directory_fsync(fd):
-                if output.exists() and output.read_bytes() == b"master":
-                    time.sleep(5)
-                return real_fsync(fd)
-
-            started = time.monotonic()
             try:
-                with mock.patch.object(os, "fsync", blocking_directory_fsync):
+                with self.assertRaisesRegex(
+                    WorkerExecutionError, "durable receipt-linked transaction"
+                ):
                     _atomic_commit_output_to_scope(
                         scope_fd,
                         Path("out.wav"),
                         source,
                         max_bytes=1024,
-                        deadline=time.monotonic() + 0.2,
+                        deadline=time.monotonic() + 1.0,
                     )
             finally:
                 os.close(scope_fd)
-            self.assertLess(time.monotonic() - started, 1.0)
-            self.assertEqual(output.read_bytes(), b"master")
+            self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.name == "posix", "public publication boundary is POSIX v0.1")
+    def test_forced_preemption_window_has_no_public_replace_operation(self):
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
+            root = Path(allowed).resolve()
+            source = Path(staging) / "master.wav"
+            source.write_bytes(b"master")
+            output = root / "out.wav"
+            scope_fd = _open_directory_no_symlinks(root)
+            try:
+                with mock.patch.object(
+                    os, "replace", side_effect=AssertionError("replace must not execute")
+                ):
+                    with self.assertRaises(WorkerExecutionError):
+                        _atomic_commit_output_to_scope(
+                            scope_fd,
+                            Path("out.wav"),
+                            source,
+                            max_bytes=1024,
+                            deadline=time.monotonic() + 1.0,
+                        )
+            finally:
+                os.close(scope_fd)
+            self.assertFalse(output.exists())
 
     @unittest.skipUnless(os.name == "posix", "descriptor-safe filesystem broker is POSIX v0.1")
     def test_omen_dry_run_succeeds_when_actual_paths_are_in_scope(self):
