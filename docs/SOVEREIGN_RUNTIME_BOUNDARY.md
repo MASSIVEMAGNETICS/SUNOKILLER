@@ -11,9 +11,9 @@ This branch implements the first clean, bounded execution slice for the Victor D
 5. **Isolated, pinned child bootstrap** — the child uses Python isolated mode (`-I`), does not inherit `PYTHONPATH`, excludes ambient CWD/user-site import resolution, and inserts only the source root derived from the already-loaded trusted runner before executing `sunokiller.runtime.worker_entry`. A lease cannot redirect the registered worker through an attacker-writable shadow package.
 6. **Bounded process execution without fork callbacks** — finite per-worker wall-clock, memory, and CPU maxima are trusted policy. POSIX CPU/address-space limits are applied inside the already-exec'd `worker_entry` before importing the registered worker, not through Python `preexec_fn`; the worker runs in its own process group/session and timeout terminates the whole descendant group.
 7. **Transactional state commit** — workers may only propose `_state`; the parent writes it with optimistic pre-state hashing, including an explicit no-snapshot first-writer precondition. Revocation and lease expiry are rechecked after `BEGIN IMMEDIATE` acquires the SQLite write lock.
-8. **Typed resource enforcement** — logical namespace scopes and filesystem scopes are distinct. The OMEN filesystem boundary is descriptor-based on POSIX: signed scope directories are traversed with `O_DIRECTORY|O_NOFOLLOW`, and inputs are copied from no-follow file descriptors into a private staging directory. Worker output remains private staging data; public output publication is deliberately refused until a durable receipt-linked transaction exists. The worker/FFmpeg never receives the caller's authorized filesystem path directly.
+8. **Typed resource enforcement** — logical namespace scopes and filesystem scopes are distinct. The OMEN filesystem boundary is descriptor-based on POSIX: signed scope directories are traversed with `O_DIRECTORY|O_NOFOLLOW`, inputs are copied from no-follow file descriptors, and the private staging root is created and cleaned by killable bounded helpers. Worker output remains private staging data; public output publication is deliberately refused until a durable receipt-linked transaction exists. The worker/FFmpeg never receives the caller's authorized filesystem path directly.
 9. **Signed execution receipts** — successful executions produce a signed receipt containing the trusted worker identity, capability/resource, input/output hashes, and pre/post state hashes.
-10. **Fail closed** — expired, revoked, unsigned/tampered, wrong-capability, out-of-scope, unregistered-worker, worker-substitution, ambient-import-shadow, disabled/over-max budget, symlink-component, colon-sibling, timeout-descendant, and stale-state attempts are rejected or prevented at the relevant boundary.
+10. **Fail closed** — expired, revoked, unsigned/tampered, wrong-capability, out-of-scope, unregistered-worker, worker-substitution, ambient-import-shadow, disabled/over-max budget, input symlink-component, colon-sibling, timeout-descendant, and stale-state attempts are rejected or prevented at the relevant boundary. Disabled output paths receive lexical scope validation only and are never traversed or published.
 11. **Reproducible exact-head verification** — `.github/workflows/sovereign-runtime.yml` compiles and executes the runtime security-contract suite on Ubuntu with Python 3.11 and 3.12 for relevant PR/push changes.
 
 ## Acceptance matrix
@@ -25,7 +25,8 @@ This branch implements the first clean, bounded execution slice for the Victor D
 | Out-of-scope logical resource | Reject |
 | Out-of-scope filesystem path | Reject |
 | Colon-sibling filesystem escape | Reject |
-| Symlink component inside signed filesystem scope | Reject before worker execution |
+| Input symlink component inside signed filesystem scope | Reject before worker execution |
+| Output symlink component while publication is disabled | Lexical scope validation only; dry run may execute, but the public path is never traversed or published |
 | Unregistered worker | Reject |
 | Signed lease subject / worker mismatch | Reject |
 | Attacker-writable CWD/PYTHONPATH contains shadow `sunokiller.runtime.worker_entry` | Ignore shadow; execute pinned trusted package entry |
@@ -44,11 +45,11 @@ This branch implements the first clean, bounded execution slice for the Victor D
 | OMEN master command | Hard 48 kHz + EBU R128 `loudnorm` contract |
 | OMEN 44.1 kHz override | Reject |
 
-`tests/test_sovereign_runtime.py` currently defines 33 unit/security-contract tests. The suite retains regressions for descendant process teardown, descriptor/path containment, lease expiry and Human STOP, trusted executable and import selection, finite execution limits, bounded signed-scope traversal, bounded input descriptor preflight, parent-free input-timeout cleanup, and fail-closed public publication. Passing GitHub Actions on the exact merge head is the reproducible executable gate; earlier reconstructed test passes remain historical evidence only.
+`tests/test_sovereign_runtime.py` currently defines 35 unit/security-contract tests. The suite retains regressions for descendant process teardown, descriptor/path containment, lease expiry and Human STOP, trusted executable and import selection, finite execution limits, bounded private staging-root creation, bounded signed-scope traversal, bounded input descriptor preflight, parent-free input-timeout cleanup, lexical-only disabled-output paths, and fail-closed public publication. Passing GitHub Actions on the exact merge head is the reproducible executable gate; earlier reconstructed test passes remain historical evidence only.
 
 ## OMEN mastering worker
 
-`omen` is exposed as a CLI and as the trusted worker `sunokiller.omen:mastering_worker` for capability-leased execution. Under the sovereign runtime, both `input_path` and `output_path` must map lexically beneath a signed absolute filesystem scope and then pass descriptor-based no-follow traversal.
+`omen` is exposed as a CLI and as the trusted worker `sunokiller.omen:mastering_worker` for capability-leased execution. Under the sovereign runtime, both `input_path` and `output_path` must map lexically beneath a signed absolute filesystem scope. The input path then passes descriptor-based no-follow traversal before execution. Because public output publication is disabled in v0.1, the output-relative path receives lexical validation only; it is never traversed or mutated by the broker. An OMEN dry run may therefore evaluate with a symlinked output component, while a non-dry run still fails closed before publication.
 
 The broker copies the authorized regular input file into a private staging directory. OMEN/FFmpeg may consume that staging path and produce a staging output, but bounded runtime v0.1 refuses to publish that output into the caller-visible filesystem. Non-dry-run OMEN therefore ends with a fail-closed `WorkerExecutionError`; only dry-run contract execution is currently accepted. Restoring public output requires a durable transaction that binds visibility to a verifiable success receipt.
 
