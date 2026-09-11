@@ -393,6 +393,70 @@ def _open_directory_bounded(path: Path, *, deadline: float) -> int:
         parent_sock.close()
 
 
+def _make_private_staging_directory_bounded(*, deadline: float) -> Path:
+    """Create the private staging root without blocking the lease-holding parent."""
+    parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    pid = os.fork()
+    if pid == 0:
+        parent_sock.close()
+        try:
+            created = tempfile.mkdtemp(prefix="sunokiller-runtime-")
+            payload = b"P" + os.fsencode(created)
+            if len(payload) > 4096:
+                os._exit(2)
+            child_sock.send(payload)
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+
+    child_sock.close()
+    parent_sock.setblocking(False)
+    try:
+        while True:
+            try:
+                payload = parent_sock.recv(4096)
+                if payload[:1] == b"P" and len(payload) > 1:
+                    _bounded_kill_and_reap(pid)
+                    return Path(os.fsdecode(payload[1:]))
+            except BlockingIOError:
+                pass
+            completed, status = os.waitpid(pid, os.WNOHANG)
+            if completed == pid:
+                if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2:
+                    raise WorkerExecutionError("private staging path exceeded transport limit")
+                raise WorkerExecutionError("private staging directory creation failed")
+            if time.monotonic() >= deadline:
+                _bounded_kill_and_reap(pid)
+                raise WorkerTimeout(
+                    "private staging directory creation exceeded end-to-end deadline"
+                )
+            time.sleep(0.01)
+    finally:
+        parent_sock.close()
+
+
+def _remove_private_staging_directory_bounded(path: Path) -> None:
+    """Best-effort bounded cleanup; never block Human STOP in the parent."""
+    pid = os.fork()
+    if pid == 0:
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+
+    try:
+        _wait_bounded_io_child(
+            pid,
+            deadline=time.monotonic() + 0.25,
+            operation="private staging cleanup",
+        )
+    except WorkerExecutionError:
+        # Cleanup cannot restore a failed execution or delay Human STOP. The
+        # staging directory is private and public publication stays disabled.
+        pass
+
+
 def _copy_regular_input_from_scope(
     scope_fd: int,
     relative: Path,
@@ -489,7 +553,6 @@ class _FilesystemStager:
         self.policy = policy
         self.original_payload = dict(payload)
         self.execution_payload = dict(payload)
-        self._temp = None
         self._root = None
         self._scope_fds = []
         self._output_commits = []
@@ -501,8 +564,7 @@ class _FilesystemStager:
             return self
 
         _require_posix_descriptor_containment()
-        self._temp = tempfile.TemporaryDirectory(prefix="sunokiller-runtime-")
-        self._root = Path(self._temp.name)
+        self._root = _make_private_staging_directory_bounded(deadline=self._deadline)
 
         try:
             for index, field in enumerate(self.policy.filesystem_inputs):
@@ -575,9 +637,9 @@ class _FilesystemStager:
             except OSError:
                 pass
         self._scope_fds.clear()
-        if self._temp is not None:
-            self._temp.cleanup()
-            self._temp = None
+        if self._root is not None:
+            _remove_private_staging_directory_bounded(self._root)
+            self._root = None
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self._cleanup()
