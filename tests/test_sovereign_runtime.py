@@ -588,6 +588,77 @@ class CapabilityBoundaryTests(unittest.TestCase):
                 )
             self.assertFalse(output.exists())
 
+    @unittest.skipUnless(os.name == "posix", "bounded staging root uses POSIX fork")
+    def test_blocking_private_staging_creation_is_bounded(self):
+        runner = self.runner()
+        omen_worker = self.omen_worker(timeout_seconds=0.1)
+        with tempfile.TemporaryDirectory() as allowed:
+            root = Path(allowed).resolve()
+            source = root / "in.wav"
+            source.write_bytes(b"audio")
+            output = root / "out.wav"
+            lease = self.authority.issue_lease(
+                subject=omen_worker.worker_id,
+                capabilities=["audio.master"],
+                resource_scopes=["catalog/masters", str(root)],
+            )
+            real_mkdtemp = tempfile.mkdtemp
+
+            def blocking_mkdtemp(*args, **kwargs):
+                time.sleep(5)
+                return real_mkdtemp(*args, **kwargs)
+
+            started = time.monotonic()
+            with mock.patch.object(tempfile, "mkdtemp", blocking_mkdtemp), mock.patch.object(
+                runner_module.subprocess,
+                "Popen",
+                side_effect=AssertionError("worker must not launch"),
+            ):
+                with self.assertRaises(WorkerTimeout):
+                    runner.execute(
+                        lease=lease,
+                        worker=omen_worker,
+                        payload={
+                            "input_path": str(source),
+                            "output_path": str(output),
+                            "dry_run": True,
+                        },
+                    )
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.name == "posix", "disabled output path contract is POSIX v0.1")
+    def test_disabled_output_symlink_is_lexical_only_and_never_published(self):
+        runner = self.runner()
+        omen_worker = self.omen_worker()
+        with tempfile.TemporaryDirectory() as allowed:
+            root = Path(allowed).resolve()
+            source = root / "in.wav"
+            source.write_bytes(b"placeholder")
+            destination = root / "destination"
+            destination.mkdir()
+            output_link = root / "output-link"
+            output_link.symlink_to(destination, target_is_directory=True)
+            output = output_link / "out.wav"
+            lease = self.authority.issue_lease(
+                subject=omen_worker.worker_id,
+                capabilities=["audio.master"],
+                resource_scopes=["catalog/masters", str(root)],
+            )
+            result, receipt = runner.execute(
+                lease=lease,
+                worker=omen_worker,
+                payload={
+                    "input_path": str(source),
+                    "output_path": str(output),
+                    "dry_run": True,
+                },
+            )
+            self.assertEqual(result["status"], "DRY_RUN")
+            self.assertEqual(result["output"], str(output))
+            self.authority.verify_receipt(receipt)
+            self.assertFalse((destination / "out.wav").exists())
+
     @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
     def test_blocking_input_copy_cannot_overrun_deadline(self):
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
