@@ -121,7 +121,7 @@ def master_file(
 
     if not source.is_file():
         raise OmenError("input does not exist: {}".format(source))
-    if not dry_run:
+    if not dry_run and not staging_fds:
         target.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = build_master_command(
