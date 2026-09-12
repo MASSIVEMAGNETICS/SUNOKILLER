@@ -798,7 +798,7 @@ class _FilesystemStager:
         return self
 
     def commit_outputs(self) -> None:
-        if self.original_payload.get("dry_run") is True:
+        if not self.policy.filesystem_outputs or self.original_payload.get("dry_run") is True:
             return
         raise WorkerExecutionError(
             "public output publication is disabled until a durable receipt-linked "
