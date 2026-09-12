@@ -1,3 +1,5 @@
+"""Security-contract regressions for the bounded sovereign runtime."""
+
 import dataclasses
 import os
 from pathlib import Path
