@@ -364,6 +364,7 @@ def _canonicalize_payload_bounded(
     if pid == 0:
         parent_sock.close()
         try:
+            _preflight_json_size(payload, max_bytes=max_bytes)
             encoder = json.JSONEncoder(
                 sort_keys=True,
                 separators=(",", ":"),
@@ -377,6 +378,8 @@ def _canonicalize_payload_bounded(
                     os._exit(2)
                 child_sock.sendall(encoded)
             os._exit(0)
+        except ResourceDenied:
+            os._exit(2)
         except BaseException:
             os._exit(1)
 
@@ -435,6 +438,97 @@ def _canonicalize_payload_bounded(
     if not isinstance(normalized, dict):
         raise WorkerExecutionError("payload must be a JSON object")
     return normalized, sha256(raw).hexdigest()
+
+
+def _preflight_json_size(value: Any, *, max_bytes: int) -> int:
+    """Count canonical JSON bytes without allocating an encoded string token."""
+    active = set()
+
+    def add(total: int, amount: int) -> int:
+        total += amount
+        if total > max_bytes:
+            raise ResourceDenied("payload exceeded its trusted byte limit")
+        return total
+
+    def string_size(text: str, total: int) -> int:
+        total = add(total, 2)
+        if len(text) + total > max_bytes:
+            raise ResourceDenied("payload exceeded its trusted byte limit")
+        for character in text:
+            codepoint = ord(character)
+            if character in ('"', "\\") or character in "\b\f\n\r\t":
+                width = 2
+            elif codepoint < 0x20:
+                width = 6
+            elif codepoint < 0x80:
+                width = 1
+            elif codepoint < 0x800:
+                width = 2
+            elif 0xD800 <= codepoint <= 0xDFFF:
+                raise ValueError("payload contains an unpaired surrogate")
+            elif codepoint < 0x10000:
+                width = 3
+            else:
+                width = 4
+            total = add(total, width)
+        return total
+
+    def measure(item: Any, total: int, depth: int) -> int:
+        if depth > 64:
+            raise ValueError("payload nesting exceeds the trusted depth limit")
+        if item is None:
+            return add(total, 4)
+        if item is True:
+            return add(total, 4)
+        if item is False:
+            return add(total, 5)
+        if type(item) is str:
+            return string_size(item, total)
+        if type(item) is int:
+            # A binary integer larger than the entire byte budget cannot have a
+            # valid decimal JSON representation within that budget.
+            if item.bit_length() > max_bytes * 4:
+                raise ResourceDenied("payload exceeded its trusted byte limit")
+            return add(total, len(str(item)))
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError("payload contains a non-finite number")
+            return add(total, len(repr(item)))
+        if type(item) is dict:
+            identity = id(item)
+            if identity in active:
+                raise ValueError("payload contains a circular reference")
+            active.add(identity)
+            try:
+                total = add(total, 2)
+                for index, (key, nested) in enumerate(item.items()):
+                    if type(key) is not str:
+                        raise ValueError("payload object keys must be strings")
+                    if index:
+                        total = add(total, 1)
+                    total = string_size(key, total)
+                    total = add(total, 1)
+                    total = measure(nested, total, depth + 1)
+                return total
+            finally:
+                active.remove(identity)
+        if type(item) in (list, tuple):
+            identity = id(item)
+            if identity in active:
+                raise ValueError("payload contains a circular reference")
+            active.add(identity)
+            try:
+                total = add(total, 2)
+                for index, nested in enumerate(item):
+                    if index:
+                        total = add(total, 1)
+                    total = measure(nested, total, depth + 1)
+                return total
+            finally:
+                active.remove(identity)
+        raise ValueError("payload contains a non-JSON value")
+
+    return measure(value, 0, 0)
 
 
 def _open_directory_bounded(path: Path, *, deadline: float) -> int:
@@ -501,11 +595,19 @@ def _required_input_seals() -> int:
     import fcntl
 
     return (
-        fcntl.F_SEAL_SEAL
-        | fcntl.F_SEAL_SHRINK
-        | fcntl.F_SEAL_GROW
-        | fcntl.F_SEAL_WRITE
+        getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+        | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+        | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+        | getattr(fcntl, "F_SEAL_WRITE", 0x0008)
     )
+
+
+def _fcntl_seal_command(name: str) -> int:
+    import fcntl
+
+    # Linux UAPI values; some minimal Python builds omit the symbolic names.
+    fallback = {"F_ADD_SEALS": 1033, "F_GET_SEALS": 1034}
+    return int(getattr(fcntl, name, fallback[name]))
 
 
 def _anonymous_descriptor_path(fd: int) -> str:
@@ -552,7 +654,10 @@ def _receive_anonymous_fd_bounded(
                                 "{} failed anonymous-file checks".format(operation)
                             )
                         if require_sealed:
-                            seals = fcntl.fcntl(received_fd, fcntl.F_GET_SEALS)
+                            seals = fcntl.fcntl(
+                                received_fd,
+                                _fcntl_seal_command("F_GET_SEALS"),
+                            )
                             required = _required_input_seals()
                             if seals & required != required:
                                 os.close(received_fd)
@@ -632,7 +737,13 @@ def _stage_regular_input_anonymous_bounded(
     max_bytes: int,
     deadline: float,
 ) -> int:
-    """Copy authorized input into a sealed memfd before transferring it."""
+    """Validate input and transfer an empty sealed dry-run capability token.
+
+    Bounded v0.1 never launches FFmpeg and the OMEN dry-run worker only checks
+    that its descriptor is a regular file. Copying audio bytes into memfd would
+    consume uncharged shmem without adding verification value, so no source byte
+    crosses this boundary.
+    """
     _require_linux_anonymous_staging()
     parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
     pid = os.fork()
@@ -660,22 +771,12 @@ def _stage_regular_input_anonymous_bounded(
                 "sunokiller-input",
                 flags=os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
             )
-            copied = 0
-            while True:
-                chunk = os.read(source_fd, min(1024 * 1024, max_bytes - copied + 1))
-                if not chunk:
-                    break
-                copied += len(chunk)
-                if copied > max_bytes:
-                    os._exit(2)
-                view = memoryview(chunk)
-                while view:
-                    written = os.write(staged_fd, view)
-                    view = view[written:]
-
-            os.lseek(staged_fd, 0, os.SEEK_SET)
             os.fchmod(staged_fd, 0o400)
-            fcntl.fcntl(staged_fd, fcntl.F_ADD_SEALS, _required_input_seals())
+            fcntl.fcntl(
+                staged_fd,
+                _fcntl_seal_command("F_ADD_SEALS"),
+                _required_input_seals(),
+            )
             rights = array.array("i", [staged_fd])
             child_sock.sendmsg([b"F"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
             os._exit(0)
@@ -721,8 +822,9 @@ def _atomic_commit_output_to_scope(
 class _FilesystemStager:
     """Broker filesystem inputs through sealed anonymous descriptors.
 
-    The worker never receives a caller-controlled authorized path. Input bytes
-    are copied into a sealed Linux memfd inside a killable bounded child.
+    The worker never receives a caller-controlled authorized path. A killable
+    child validates input metadata and gives the dry-run worker only an empty,
+    sealed Linux memfd token; protected input bytes never enter the worker.
     Output receives an anonymous memfd only for dry-run contract construction;
     bounded v0.1 rejects every native file-producing execution before launch.
     """
@@ -810,11 +912,16 @@ class _FilesystemStager:
         return tuple(self._staging_fds)
 
     def restore_public_paths(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        restored = dict(result)
-        for key, value in tuple(restored.items()):
-            if isinstance(value, str) and value in self._public_path_map:
-                restored[key] = self._public_path_map[value]
-        return restored
+        def restore(value: Any) -> Any:
+            if isinstance(value, str):
+                return self._public_path_map.get(value, value)
+            if isinstance(value, list):
+                return [restore(item) for item in value]
+            if isinstance(value, dict):
+                return {key: restore(item) for key, item in value.items()}
+            return value
+
+        return restore(dict(result))
 
     def _cleanup(self) -> None:
         for fd in self._scope_fds + self._staging_fds:
@@ -849,7 +956,7 @@ class IsolatedRunner:
     - POSIX CPU/memory limits are applied inside worker_entry after exec, not
       through preexec_fn in the multithreaded parent;
     - payload canonicalization is process-isolated, deadline-bound, and byte-limited;
-    - filesystem inputs use sealed anonymous Linux descriptors;
+    - filesystem dry-run inputs use empty sealed anonymous Linux descriptors;
     - the worker never receives the original authorized filesystem paths;
     - lease validity is rechecked after the subprocess returns and before receipt;
     - worker-proposed state and native output execution fail closed without a write transaction;
@@ -944,7 +1051,8 @@ class IsolatedRunner:
             )
 
         try:
-            revoked_ids = self.state_store.revoked_ids(
+            revoked = self.state_store.is_revoked(
+                lease.lease_id,
                 deadline_monotonic=deadline,
             )
         except StateDeadlineExceeded as exc:
@@ -955,7 +1063,7 @@ class IsolatedRunner:
             lease,
             required_capability=policy.capability,
             resource=policy.logical_resource,
-            revoked_ids=revoked_ids,
+            revoked_ids={lease.lease_id} if revoked else (),
             resource_kind="logical",
         )
 
@@ -1047,7 +1155,7 @@ class IsolatedRunner:
             deadline=deadline,
         )
         try:
-            pre = self.state_store.load_latest(
+            pre_hash = self.state_store.load_latest_hash(
                 self.state_key,
                 deadline_monotonic=deadline,
             )
@@ -1055,7 +1163,7 @@ class IsolatedRunner:
             raise WorkerTimeout(
                 "end-to-end execution deadline expired while loading state"
             ) from exc
-        pre_hash = pre.state_hash if pre else digest_json({})
+        pre_hash = pre_hash or digest_json({})
 
         if policy.filesystem_outputs and input_payload.get("dry_run") is not True:
             raise WorkerExecutionError(
@@ -1150,4 +1258,3 @@ class IsolatedRunner:
             status="SUCCESS",
         )
         return result, self.authority.sign_receipt(receipt)
-

@@ -5,6 +5,9 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
+import os
+import signal
+import socket
 import sqlite3
 import threading
 import time
@@ -24,6 +27,25 @@ class StateDeadlineExceeded(RuntimeError):
 # Optimistic-concurrency sentinel meaning: this write is valid only if the
 # state key has never had a snapshot. This is intentionally not a hash value.
 NO_SNAPSHOT_PRECONDITION = "__NO_SNAPSHOT__"
+
+_BOUNDED_STATE_RESPONSE_BYTES = 4096
+
+
+def _bounded_kill_and_reap(pid: int) -> None:
+    """Stop a state-read helper without blocking the lease-holding parent."""
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    reap_deadline = time.monotonic() + 0.25
+    while time.monotonic() < reap_deadline:
+        try:
+            completed, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if completed == pid:
+            return
+        time.sleep(0.01)
 
 
 @dataclass(frozen=True)
@@ -133,12 +155,151 @@ class SQLiteStateStore:
         with self._lock:
             self._conn.close()
 
+    def _read_scalar_bounded(
+        self,
+        query: str,
+        parameter: str,
+        *,
+        deadline_monotonic: float,
+    ) -> Any:
+        """Run one trusted scalar SELECT in a killable helper process.
+
+        The lease-holding parent never performs deadline-bearing SQLite I/O.
+        Only fixed internal SELECT statements call this method, and the child
+        response is capped before it crosses the process boundary.
+        """
+        if os.name != "posix" or not hasattr(os, "fork"):
+            raise StateDeadlineExceeded(
+                "deadline-bound state reads require POSIX process isolation in v0.1"
+            )
+        self._assert_deadline(deadline_monotonic)
+
+        parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        pid = os.fork()
+        if pid == 0:
+            parent_sock.close()
+            connection = None
+            try:
+                # Never use the inherited connection or parent RLock after fork.
+                connection = sqlite3.connect(
+                    self.path,
+                    check_same_thread=False,
+                    isolation_level=None,
+                    timeout=0.0,
+                )
+                connection.execute("PRAGMA query_only=ON")
+                row = connection.execute(query, (parameter,)).fetchone()
+                value = None if row is None else row[0]
+                encoded = json.dumps(
+                    {"value": value},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                if len(encoded) > _BOUNDED_STATE_RESPONSE_BYTES:
+                    os._exit(2)
+                child_sock.sendall(encoded)
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+
+        child_sock.close()
+        parent_sock.setblocking(False)
+        chunks = []
+        total = 0
+        try:
+            while True:
+                try:
+                    chunk = parent_sock.recv(_BOUNDED_STATE_RESPONSE_BYTES)
+                    if chunk:
+                        total += len(chunk)
+                        if total > _BOUNDED_STATE_RESPONSE_BYTES:
+                            _bounded_kill_and_reap(pid)
+                            raise StateDeadlineExceeded(
+                                "bounded state read exceeded its response budget"
+                            )
+                        chunks.append(chunk)
+                except BlockingIOError:
+                    pass
+
+                completed, status = os.waitpid(pid, os.WNOHANG)
+                if completed == pid:
+                    while True:
+                        try:
+                            chunk = parent_sock.recv(_BOUNDED_STATE_RESPONSE_BYTES)
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > _BOUNDED_STATE_RESPONSE_BYTES:
+                            raise StateDeadlineExceeded(
+                                "bounded state read exceeded its response budget"
+                            )
+                        chunks.append(chunk)
+                    if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                        raise StateDeadlineExceeded(
+                            "deadline-bound state read failed closed"
+                        )
+                    break
+
+                if time.monotonic() >= deadline_monotonic:
+                    _bounded_kill_and_reap(pid)
+                    raise StateDeadlineExceeded(
+                        "state read exceeded end-to-end deadline"
+                    )
+                time.sleep(0.01)
+        finally:
+            parent_sock.close()
+
+        self._assert_deadline(deadline_monotonic)
+        try:
+            message = json.loads(b"".join(chunks).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StateDeadlineExceeded(
+                "bounded state read returned an invalid response"
+            ) from exc
+        if not isinstance(message, dict) or "value" not in message:
+            raise StateDeadlineExceeded("bounded state read returned an invalid response")
+        return message["value"]
+
+    def load_latest_hash(
+        self,
+        key: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Optional[str]:
+        """Read only the bounded-runtime pre-state hash."""
+        query = """
+            SELECT state_hash
+            FROM state_snapshots
+            WHERE key = ?
+            ORDER BY version DESC
+            LIMIT 1
+        """
+        if deadline_monotonic is not None:
+            value = self._read_scalar_bounded(
+                query,
+                key,
+                deadline_monotonic=deadline_monotonic,
+            )
+        else:
+            with self._locked_until(None):
+                row = self._conn.execute(query, (key,)).fetchone()
+            value = None if row is None else row[0]
+        if value is not None and not isinstance(value, str):
+            raise StateDeadlineExceeded("bounded state hash read returned an invalid value")
+        return value
+
     def load_latest(
         self,
         key: str,
         *,
         deadline_monotonic: Optional[float] = None,
     ) -> Optional[StateSnapshot]:
+        if deadline_monotonic is not None:
+            raise StateDeadlineExceeded(
+                "deadline-bound full-state loading is disabled; read the state hash instead"
+            )
         with self._locked_until(deadline_monotonic):
             row = self._conn.execute(
                 """
@@ -190,6 +351,15 @@ class SQLiteStateStore:
         deadline_monotonic: Optional[float] = None,
     ) -> None:
         """Fail if revocation/expiry is already durable at this instant."""
+        if deadline_monotonic is not None:
+            if self.is_revoked(
+                lease_id,
+                deadline_monotonic=deadline_monotonic,
+            ):
+                raise LeaseRevoked("lease has been revoked")
+            self._assert_deadline(deadline_monotonic)
+            self._assert_not_expired(expires_at)
+            return
         with self._locked_until(deadline_monotonic):
             self._assert_lease_active_locked(lease_id, expires_at=expires_at)
 
@@ -324,6 +494,17 @@ class SQLiteStateStore:
         *,
         deadline_monotonic: Optional[float] = None,
     ) -> bool:
+        if deadline_monotonic is not None:
+            value = self._read_scalar_bounded(
+                "SELECT 1 FROM lease_revocations WHERE lease_id = ? LIMIT 1",
+                lease_id,
+                deadline_monotonic=deadline_monotonic,
+            )
+            if value not in (None, 1):
+                raise StateDeadlineExceeded(
+                    "bounded revocation read returned an invalid value"
+                )
+            return value == 1
         with self._locked_until(deadline_monotonic):
             return self._lease_is_revoked_locked(lease_id)
 
@@ -332,6 +513,10 @@ class SQLiteStateStore:
         *,
         deadline_monotonic: Optional[float] = None,
     ) -> Set[str]:
+        if deadline_monotonic is not None:
+            raise StateDeadlineExceeded(
+                "deadline-bound revocation enumeration is disabled; query one lease instead"
+            )
         with self._locked_until(deadline_monotonic):
             rows = self._conn.execute("SELECT lease_id FROM lease_revocations").fetchall()
         return {row[0] for row in rows}

@@ -271,6 +271,10 @@ class CapabilityBoundaryTests(unittest.TestCase):
             IsolatedRunner,
             "_run_worker",
             side_effect=AssertionError("oversized payload must not launch"),
+        ), mock.patch.object(
+            runner_module.json.JSONEncoder,
+            "iterencode",
+            side_effect=AssertionError("oversized string must fail before JSON encoding"),
         ):
             with self.assertRaises(ResourceDenied):
                 self.runner().execute(
@@ -280,6 +284,30 @@ class CapabilityBoundaryTests(unittest.TestCase):
                 )
         self.assertLess(time.monotonic() - started, 1.0)
         self.assertIsNone(self.store.load_latest("runtime"))
+
+    @unittest.skipUnless(os.name == "posix", "killable state reads require POSIX")
+    def test_blocking_sqlite_read_cannot_delay_human_stop_deadline(self):
+        lease = self.issue()
+        worker = dataclasses.replace(self.demo_worker(), timeout_seconds=0.1)
+        real_connect = sqlite3.connect
+
+        def blocking_connect(*args, **kwargs):
+            time.sleep(5)
+            return real_connect(*args, **kwargs)
+
+        started = time.monotonic()
+        with mock.patch.object(sqlite3, "connect", blocking_connect), mock.patch.object(
+            IsolatedRunner,
+            "_run_worker",
+            side_effect=AssertionError("worker must not launch after state timeout"),
+        ):
+            with self.assertRaises(WorkerTimeout):
+                self.runner().execute(
+                    lease=lease,
+                    worker=worker,
+                    payload={"value": 4},
+                )
+        self.assertLess(time.monotonic() - started, 1.0)
 
     def test_unregistered_worker_is_rejected_before_execution(self):
         worker = WorkerSpec(
@@ -676,7 +704,7 @@ class CapabilityBoundaryTests(unittest.TestCase):
         sys.platform.startswith("linux") and hasattr(os, "memfd_create"),
         "sealed anonymous input requires Linux memfd",
     )
-    def test_anonymous_input_is_sealed_without_tmpdir_path_lookup(self):
+    def test_anonymous_dry_run_token_is_empty_sealed_and_never_reads_input(self):
         with tempfile.TemporaryDirectory() as allowed:
             root = Path(allowed).resolve()
             (root / "in.wav").write_bytes(b"trusted-input")
@@ -687,6 +715,10 @@ class CapabilityBoundaryTests(unittest.TestCase):
                     tempfile,
                     "mkdtemp",
                     side_effect=AssertionError("pathname staging must not execute"),
+                ), mock.patch.object(
+                    os,
+                    "read",
+                    side_effect=AssertionError("dry-run staging must not copy input bytes"),
                 ):
                     staged_fd = _stage_regular_input_anonymous_bounded(
                         scope_fd,
@@ -694,17 +726,16 @@ class CapabilityBoundaryTests(unittest.TestCase):
                         max_bytes=1024,
                         deadline=time.monotonic() + 1.0,
                     )
-                required = (
-                    fcntl.F_SEAL_SEAL
-                    | fcntl.F_SEAL_SHRINK
-                    | fcntl.F_SEAL_GROW
-                    | fcntl.F_SEAL_WRITE
-                )
+                required = runner_module._required_input_seals()
                 self.assertEqual(
-                    fcntl.fcntl(staged_fd, fcntl.F_GET_SEALS) & required,
+                    fcntl.fcntl(
+                        staged_fd,
+                        runner_module._fcntl_seal_command("F_GET_SEALS"),
+                    )
+                    & required,
                     required,
                 )
-                self.assertEqual(os.pread(staged_fd, 64, 0), b"trusted-input")
+                self.assertEqual(os.pread(staged_fd, 64, 0), b"")
                 with self.assertRaises(OSError):
                     os.pwrite(staged_fd, b"attacker", 0)
             finally:
@@ -748,28 +779,29 @@ class CapabilityBoundaryTests(unittest.TestCase):
         sys.platform.startswith("linux") and hasattr(os, "memfd_create"),
         "sealed anonymous input requires Linux memfd",
     )
-    def test_blocking_input_copy_cannot_overrun_deadline(self):
+    def test_dry_run_staging_does_not_copy_input_bytes(self):
         with tempfile.TemporaryDirectory() as allowed:
             root = Path(allowed).resolve()
             (root / "in.wav").write_bytes(b"audio")
             scope_fd = _open_directory_no_symlinks(root)
-            real_read = os.read
-
-            def blocking_read(*args, **kwargs):
-                time.sleep(5)
-                return real_read(*args, **kwargs)
-
             started = time.monotonic()
+            staged_fd = None
             try:
-                with mock.patch.object(os, "read", blocking_read):
-                    with self.assertRaises(WorkerTimeout):
-                        _stage_regular_input_anonymous_bounded(
-                            scope_fd,
-                            Path("in.wav"),
-                            max_bytes=1024,
-                            deadline=time.monotonic() + 0.1,
-                        )
+                with mock.patch.object(
+                    os,
+                    "read",
+                    side_effect=AssertionError("input bytes must remain outside the worker"),
+                ):
+                    staged_fd = _stage_regular_input_anonymous_bounded(
+                        scope_fd,
+                        Path("in.wav"),
+                        max_bytes=1024,
+                        deadline=time.monotonic() + 0.5,
+                    )
+                self.assertEqual(os.fstat(staged_fd).st_size, 0)
             finally:
+                if staged_fd is not None:
+                    os.close(staged_fd)
                 os.close(scope_fd)
             self.assertLess(time.monotonic() - started, 1.0)
 
@@ -830,12 +862,12 @@ class CapabilityBoundaryTests(unittest.TestCase):
             root = Path(allowed).resolve()
             (root / "in.wav").write_bytes(b"audio")
             scope_fd = _open_directory_no_symlinks(root)
-            real_read = os.read
+            real_fstat = os.fstat
             parent_pid = os.getpid()
 
-            def blocking_read(*args, **kwargs):
+            def blocking_fstat(*args, **kwargs):
                 time.sleep(5)
-                return real_read(*args, **kwargs)
+                return real_fstat(*args, **kwargs)
 
             def forbidden_parent_path_call(*args, **kwargs):
                 if os.getpid() == parent_pid:
@@ -844,7 +876,7 @@ class CapabilityBoundaryTests(unittest.TestCase):
 
             started = time.monotonic()
             try:
-                with mock.patch.object(os, "read", blocking_read), mock.patch.object(
+                with mock.patch.object(os, "fstat", blocking_fstat), mock.patch.object(
                     Path, "is_file", forbidden_parent_path_call
                 ), mock.patch.object(Path, "unlink", forbidden_parent_path_call):
                     with self.assertRaises(WorkerTimeout):
@@ -933,6 +965,51 @@ class CapabilityBoundaryTests(unittest.TestCase):
             self.assertEqual(result["input"], str(source))
             self.assertEqual(result["output"], str(output))
             self.authority.verify_receipt(receipt)
+
+    @unittest.skipUnless(os.name == "posix", "descriptor-safe filesystem broker is POSIX v0.1")
+    def test_nested_descriptor_paths_are_restored_and_receipt_hash_is_stable(self):
+        runner = self.runner()
+        omen_worker = self.omen_worker()
+        with tempfile.TemporaryDirectory() as allowed:
+            root = Path(allowed).resolve()
+            source = root / "in.wav"
+            output = root / "out.wav"
+            source.write_bytes(b"placeholder")
+            lease = self.authority.issue_lease(
+                subject=omen_worker.worker_id,
+                capabilities=["audio.master"],
+                resource_scopes=["catalog/masters", str(root)],
+            )
+            payload = {
+                "input_path": str(source),
+                "output_path": str(output),
+                "dry_run": True,
+            }
+            first_result, first_receipt = runner.execute(
+                lease=lease,
+                worker=omen_worker,
+                payload=payload,
+            )
+            padding_fds = [os.open("/dev/null", os.O_RDONLY) for _ in range(8)]
+            try:
+                second_result, second_receipt = runner.execute(
+                    lease=lease,
+                    worker=omen_worker,
+                    payload=payload,
+                )
+            finally:
+                for fd in padding_fds:
+                    os.close(fd)
+
+            self.assertEqual(first_result, second_result)
+            self.assertEqual(first_receipt.output_hash, second_receipt.output_hash)
+            self.assertIn(str(source), first_result["command"])
+            self.assertIn(str(output), first_result["command"])
+            self.assertFalse(
+                any("/proc/self/fd/" in item for item in first_result["command"])
+            )
+            self.authority.verify_receipt(first_receipt)
+            self.authority.verify_receipt(second_receipt)
 
 
 class OmenHarnessTests(unittest.TestCase):
