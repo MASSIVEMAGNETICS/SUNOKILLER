@@ -1,6 +1,7 @@
 """Security-contract regressions for the bounded sovereign runtime."""
 
 import dataclasses
+import fcntl
 import os
 from pathlib import Path
 import sqlite3
@@ -24,11 +25,15 @@ from sunokiller.runtime.runner import (
     WorkerExecutionError,
     WorkerTimeout,
     _atomic_commit_output_to_scope,
-    _copy_regular_input_from_scope,
+    _stage_regular_input_anonymous_bounded,
     _open_directory_no_symlinks,
     _open_directory_bounded,
 )
-from sunokiller.runtime.state import NO_SNAPSHOT_PRECONDITION, StateConflict
+from sunokiller.runtime.state import (
+    NO_SNAPSHOT_PRECONDITION,
+    StateConflict,
+    StateDeadlineExceeded,
+)
 from sunokiller.omen import OmenError, build_master_command
 
 
@@ -216,24 +221,38 @@ class CapabilityBoundaryTests(unittest.TestCase):
         self.assertIsInstance(failures[0], LeaseExpired)
         self.assertIsNone(self.store.load_latest("expiry-runtime"))
 
-    def test_state_commit_respects_execution_deadline(self):
-        lease = self.issue()
-        worker = dataclasses.replace(self.demo_worker(), timeout_seconds=0.75)
-        blocker = sqlite3.connect(self.db_path, isolation_level=None)
-        blocker.execute("BEGIN IMMEDIATE")
+    def test_deadline_bound_state_commit_is_refused_before_transaction(self):
         started = time.monotonic()
-        try:
-            with self.assertRaises(WorkerTimeout):
+        with mock.patch.object(
+            self.store,
+            "_immediate_transaction",
+            side_effect=AssertionError("SQLite transaction must not begin"),
+        ):
+            with self.assertRaises(StateDeadlineExceeded):
+                self.store.save_snapshot(
+                    "runtime",
+                    {"value": 5},
+                    deadline_monotonic=time.monotonic() + 1.0,
+                )
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertIsNone(self.store.load_latest("runtime"))
+
+    def test_worker_proposed_state_is_rejected_without_sqlite_transaction(self):
+        lease = self.issue()
+        with mock.patch.object(
+            self.store,
+            "save_snapshot",
+            side_effect=AssertionError("state commit must not execute"),
+        ):
+            with self.assertRaisesRegex(
+                WorkerExecutionError,
+                "worker-proposed state mutation is disabled",
+            ):
                 self.runner().execute(
                     lease=lease,
-                    worker=worker,
-                    payload={"value": 4},
+                    worker=self.demo_worker(),
+                    payload={"value": 4, "propose_state": True},
                 )
-        finally:
-            blocker.execute("COMMIT")
-            blocker.close()
-
-        self.assertLess(time.monotonic() - started, 1.5)
         self.assertIsNone(self.store.load_latest("runtime"))
 
     def test_signed_lease_is_bound_to_exact_worker_code(self):
@@ -244,6 +263,23 @@ class CapabilityBoundaryTests(unittest.TestCase):
                 worker=self.omen_worker(),
                 payload={"input_path": "x", "output_path": "y"},
             )
+
+    def test_payload_size_limit_blocks_worker_launch(self):
+        lease = self.issue()
+        started = time.monotonic()
+        with mock.patch.object(
+            IsolatedRunner,
+            "_run_worker",
+            side_effect=AssertionError("oversized payload must not launch"),
+        ):
+            with self.assertRaises(ResourceDenied):
+                self.runner().execute(
+                    lease=lease,
+                    worker=self.demo_worker(),
+                    payload={"value": 4, "unused": "x" * (65 * 1024)},
+                )
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIsNone(self.store.load_latest("runtime"))
 
     def test_unregistered_worker_is_rejected_before_execution(self):
         worker = WorkerSpec(
@@ -450,68 +486,88 @@ class CapabilityBoundaryTests(unittest.TestCase):
                     },
                 )
 
-    @unittest.skipUnless(os.name == "posix", "process-group regression uses POSIX executable semantics")
-    def test_worker_timeout_kills_ffmpeg_descendant(self):
-        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as fake_bin:
-            root = Path(allowed).resolve()
-            source = root / "in.wav"
-            source.write_bytes(b"placeholder")
-            output = root / "out.wav"
-            marker = root / "descendant-survived.txt"
-
-            fake_ffmpeg = Path(fake_bin) / "ffmpeg"
-            fake_ffmpeg.write_text(
-                "#!{}\n"
-                "import time\n"
-                "from pathlib import Path\n"
-                "time.sleep(0.8)\n"
-                "Path({!r}).write_text('survived')\n".format(sys.executable, str(marker)),
+    @unittest.skipUnless(os.name == "posix", "process-group regression uses POSIX sessions")
+    def test_worker_timeout_kills_descendant_process_group(self):
+        with tempfile.TemporaryDirectory() as work:
+            marker = Path(work) / "descendant-survived.txt"
+            script = Path(work) / "worker.py"
+            script.write_text(
+                "import json, subprocess, sys, time\n"
+                "json.load(sys.stdin)\n"
+                "subprocess.Popen([sys.executable, '-c', "
+                + repr(
+                    "import time; from pathlib import Path; "
+                    "time.sleep(0.8); Path({!r}).write_text('survived')".format(
+                        str(marker)
+                    )
+                )
+                + "])\n"
+                "time.sleep(5)\n",
                 encoding="utf-8",
             )
-            fake_ffmpeg.chmod(0o755)
-            runner = self.runner({"ffmpeg": str(fake_ffmpeg)})
-
-            omen_worker = self.omen_worker(timeout_seconds=0.15)
-            lease = self.authority.issue_lease(
-                subject=omen_worker.worker_id,
-                capabilities=["audio.master"],
-                resource_scopes=["catalog/masters", str(root)],
-            )
-
-            old_path = os.environ.get("PATH", "")
-            os.environ["PATH"] = str(fake_bin) + os.pathsep + old_path
-            try:
+            runner = self.runner()
+            with mock.patch.object(
+                runner_module,
+                "_isolated_worker_command",
+                return_value=(sys.executable, str(script)),
+            ):
                 with self.assertRaises(WorkerTimeout):
-                    runner.execute(
-                        lease=lease,
-                        worker=omen_worker,
-                        payload={
-                            "input_path": str(source),
-                            "output_path": str(output),
-                        },
+                    runner._run_worker(
+                        worker=dataclasses.replace(
+                            self.demo_worker(), timeout_seconds=0.15
+                        ),
+                        envelope={},
+                        limits={"timeout_seconds": 0.15},
                     )
-            finally:
-                os.environ["PATH"] = old_path
-
             time.sleep(1.0)
             self.assertFalse(marker.exists())
-            self.assertFalse(output.exists())
 
-    @unittest.skipUnless(os.name == "posix", "process-group regression uses POSIX executable semantics")
+    @unittest.skipUnless(os.name == "posix", "process-group regression uses POSIX sessions")
     def test_timeout_kills_group_when_worker_leader_already_exited(self):
+        with tempfile.TemporaryDirectory() as work:
+            marker = Path(work) / "orphan-survived.txt"
+            script = Path(work) / "worker.py"
+            script.write_text(
+                "import json, subprocess, sys\n"
+                "json.load(sys.stdin)\n"
+                "subprocess.Popen([sys.executable, '-c', "
+                + repr(
+                    "import time; from pathlib import Path; "
+                    "time.sleep(0.8); Path({!r}).write_text('survived')".format(
+                        str(marker)
+                    )
+                )
+                + "])\n",
+                encoding="utf-8",
+            )
+            runner = self.runner()
+            with mock.patch.object(
+                runner_module,
+                "_isolated_worker_command",
+                return_value=(sys.executable, str(script)),
+            ):
+                with self.assertRaises(WorkerTimeout):
+                    runner._run_worker(
+                        worker=dataclasses.replace(
+                            self.demo_worker(), timeout_seconds=0.15
+                        ),
+                        envelope={},
+                        limits={"timeout_seconds": 0.15},
+                    )
+            time.sleep(1.0)
+            self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(os.name == "posix", "native execution fail-closed test uses POSIX")
+    def test_bounded_runtime_never_executes_configured_or_ambient_ffmpeg(self):
         with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as fake_bin:
             root = Path(allowed).resolve()
             source = root / "in.wav"
-            source.write_bytes(b"placeholder")
+            source.write_bytes(b"audio")
             output = root / "out.wav"
-            marker = root / "orphan-survived.txt"
+            marker = root / "ffmpeg-ran.txt"
             fake_ffmpeg = Path(fake_bin) / "ffmpeg"
             fake_ffmpeg.write_text(
-                "#!{}\n"
-                "import subprocess,sys\n"
-                "subprocess.Popen([sys.executable, '-c', "
-                "\"import time; from pathlib import Path; time.sleep(0.8); "
-                "Path({!r}).write_text('survived')\"])\n".format(
+                "#!{}\nfrom pathlib import Path\nPath({!r}).write_text('ran')\n".format(
                     sys.executable, str(marker)
                 ),
                 encoding="utf-8",
@@ -523,58 +579,20 @@ class CapabilityBoundaryTests(unittest.TestCase):
                 capabilities=["audio.master"],
                 resource_scopes=["catalog/masters", str(root)],
             )
-            with self.assertRaises(WorkerTimeout):
-                runner.execute(
-                    lease=lease,
-                    worker=self.omen_worker(timeout_seconds=0.15),
-                    payload={"input_path": str(source), "output_path": str(output)},
-                )
-            time.sleep(1.0)
-            self.assertFalse(marker.exists())
-            self.assertFalse(output.exists())
-
-    @unittest.skipUnless(os.name == "posix", "trusted executable regression uses POSIX executable semantics")
-    def test_omen_uses_pinned_ffmpeg_not_ambient_path(self):
-        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as trusted_bin, tempfile.TemporaryDirectory() as hostile_bin:
-            root = Path(allowed).resolve()
-            source = root / "in.wav"
-            source.write_bytes(b"audio")
-            output = root / "out.wav"
-            marker = root / "ambient-ffmpeg-ran.txt"
-            trusted = Path(trusted_bin) / "ffmpeg"
-            trusted.write_text(
-                "#!{}\nfrom pathlib import Path\nimport sys\n"
-                "Path(sys.argv[-1]).write_bytes(b'mastered')\n".format(sys.executable),
-                encoding="utf-8",
-            )
-            trusted.chmod(0o755)
-            hostile = Path(hostile_bin) / "ffmpeg"
-            hostile.write_text(
-                "#!{}\nfrom pathlib import Path\nPath({!r}).write_text('owned')\n".format(
-                    sys.executable, str(marker)
-                ),
-                encoding="utf-8",
-            )
-            hostile.chmod(0o755)
-            old_path = os.environ.get("PATH", "")
-            os.environ["PATH"] = str(hostile_bin) + os.pathsep + old_path
-            try:
-                runner = self.runner({"ffmpeg": str(trusted)})
-                lease = self.authority.issue_lease(
-                    subject=self.omen_worker().worker_id,
-                    capabilities=["audio.master"],
-                    resource_scopes=["catalog/masters", str(root)],
-                )
+            with mock.patch.object(
+                runner_module.subprocess,
+                "Popen",
+                side_effect=AssertionError("no worker or FFmpeg may launch"),
+            ):
                 with self.assertRaisesRegex(
-                    WorkerExecutionError, "durable receipt-linked transaction"
+                    WorkerExecutionError,
+                    "native file-producing execution is disabled",
                 ):
                     runner.execute(
                         lease=lease,
                         worker=self.omen_worker(),
                         payload={"input_path": str(source), "output_path": str(output)},
                     )
-            finally:
-                os.environ["PATH"] = old_path
             self.assertFalse(output.exists())
             self.assertFalse(marker.exists())
 
@@ -610,8 +628,11 @@ class CapabilityBoundaryTests(unittest.TestCase):
                 )
             self.assertFalse(output.exists())
 
-    @unittest.skipUnless(os.name == "posix", "bounded staging root uses POSIX fork")
-    def test_blocking_private_staging_creation_is_bounded(self):
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and hasattr(os, "memfd_create"),
+        "anonymous staging requires Linux memfd",
+    )
+    def test_blocking_anonymous_staging_creation_is_bounded(self):
         runner = self.runner()
         omen_worker = self.omen_worker(timeout_seconds=0.1)
         with tempfile.TemporaryDirectory() as allowed:
@@ -624,14 +645,16 @@ class CapabilityBoundaryTests(unittest.TestCase):
                 capabilities=["audio.master"],
                 resource_scopes=["catalog/masters", str(root)],
             )
-            real_mkdtemp = tempfile.mkdtemp
+            real_memfd_create = os.memfd_create
 
-            def blocking_mkdtemp(*args, **kwargs):
+            def blocking_memfd_create(*args, **kwargs):
                 time.sleep(5)
-                return real_mkdtemp(*args, **kwargs)
+                return real_memfd_create(*args, **kwargs)
 
             started = time.monotonic()
-            with mock.patch.object(tempfile, "mkdtemp", blocking_mkdtemp), mock.patch.object(
+            with mock.patch.object(
+                os, "memfd_create", blocking_memfd_create
+            ), mock.patch.object(
                 runner_module.subprocess,
                 "Popen",
                 side_effect=AssertionError("worker must not launch"),
@@ -649,83 +672,45 @@ class CapabilityBoundaryTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 1.0)
             self.assertFalse(output.exists())
 
-    @unittest.skipUnless(os.name == "posix", "descriptor-retained staging uses POSIX descriptors")
-    def test_staging_root_path_substitution_cannot_change_worker_input(self):
-        runner = self.runner()
-        omen_worker = self.omen_worker()
-        real_make = runner_module._make_private_staging_directory_bounded
-        retained = {}
-
-        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging_base:
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and hasattr(os, "memfd_create"),
+        "sealed anonymous input requires Linux memfd",
+    )
+    def test_anonymous_input_is_sealed_without_tmpdir_path_lookup(self):
+        with tempfile.TemporaryDirectory() as allowed:
             root = Path(allowed).resolve()
-            source = root / "in.wav"
-            source.write_bytes(b"trusted-input")
-            output = root / "out.wav"
-            lease = self.authority.issue_lease(
-                subject=omen_worker.worker_id,
-                capabilities=["audio.master"],
-                resource_scopes=["catalog/masters", str(root)],
-            )
-
-            def substitute_returned_path(*, deadline):
-                parent_fd, root_fd, name = real_make(deadline=deadline)
-                retained_name = name + "-retained"
-                os.rename(name, retained_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                os.mkdir(name, 0o700, dir_fd=parent_fd)
-                replacement_fd = os.open(
-                    name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=parent_fd,
-                )
-                try:
-                    attacker_fd = os.open(
-                        "input-0.wav",
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                        0o600,
-                        dir_fd=replacement_fd,
+            (root / "in.wav").write_bytes(b"trusted-input")
+            scope_fd = _open_directory_no_symlinks(root)
+            staged_fd = None
+            try:
+                with mock.patch.object(
+                    tempfile,
+                    "mkdtemp",
+                    side_effect=AssertionError("pathname staging must not execute"),
+                ):
+                    staged_fd = _stage_regular_input_anonymous_bounded(
+                        scope_fd,
+                        Path("in.wav"),
+                        max_bytes=1024,
+                        deadline=time.monotonic() + 1.0,
                     )
-                    try:
-                        os.write(attacker_fd, b"attacker-substitute")
-                    finally:
-                        os.close(attacker_fd)
-                finally:
-                    os.close(replacement_fd)
-                retained["original"] = Path(staging_base) / retained_name
-                retained["replacement"] = Path(staging_base) / name
-                return parent_fd, root_fd, name
-
-            with mock.patch.object(
-                tempfile, "tempdir", str(Path(staging_base).resolve())
-            ), mock.patch.object(
-                runner_module,
-                "_make_private_staging_directory_bounded",
-                side_effect=substitute_returned_path,
-            ), mock.patch.object(
-                runner_module,
-                "_remove_private_staging_directory_bounded",
-                return_value=None,
-            ):
-                result, receipt = runner.execute(
-                    lease=lease,
-                    worker=omen_worker,
-                    payload={
-                        "input_path": str(source),
-                        "output_path": str(output),
-                        "dry_run": True,
-                    },
+                required = (
+                    fcntl.F_SEAL_SEAL
+                    | fcntl.F_SEAL_SHRINK
+                    | fcntl.F_SEAL_GROW
+                    | fcntl.F_SEAL_WRITE
                 )
-
-            self.assertEqual(result["status"], "DRY_RUN")
-            self.authority.verify_receipt(receipt)
-            self.assertEqual(
-                (retained["original"] / "input-0.wav").read_bytes(),
-                b"trusted-input",
-            )
-            self.assertEqual(
-                (retained["replacement"] / "input-0.wav").read_bytes(),
-                b"attacker-substitute",
-            )
-            self.assertFalse(output.exists())
+                self.assertEqual(
+                    fcntl.fcntl(staged_fd, fcntl.F_GET_SEALS) & required,
+                    required,
+                )
+                self.assertEqual(os.pread(staged_fd, 64, 0), b"trusted-input")
+                with self.assertRaises(OSError):
+                    os.pwrite(staged_fd, b"attacker", 0)
+            finally:
+                if staged_fd is not None:
+                    os.close(staged_fd)
+                os.close(scope_fd)
 
     @unittest.skipUnless(os.name == "posix", "disabled output path contract is POSIX v0.1")
     def test_disabled_output_symlink_is_lexical_only_and_never_published(self):
@@ -759,36 +744,34 @@ class CapabilityBoundaryTests(unittest.TestCase):
             self.authority.verify_receipt(receipt)
             self.assertFalse((destination / "out.wav").exists())
 
-    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and hasattr(os, "memfd_create"),
+        "sealed anonymous input requires Linux memfd",
+    )
     def test_blocking_input_copy_cannot_overrun_deadline(self):
-        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
+        with tempfile.TemporaryDirectory() as allowed:
             root = Path(allowed).resolve()
-            source = root / "in.wav"
-            source.write_bytes(b"audio")
-            target = Path(staging) / "staged.wav"
+            (root / "in.wav").write_bytes(b"audio")
             scope_fd = _open_directory_no_symlinks(root)
-            real_open = Path.open
+            real_read = os.read
 
-            def blocking_open(path, *args, **kwargs):
-                if Path(path) == target:
-                    time.sleep(5)
-                return real_open(path, *args, **kwargs)
+            def blocking_read(*args, **kwargs):
+                time.sleep(5)
+                return real_read(*args, **kwargs)
 
             started = time.monotonic()
             try:
-                with mock.patch.object(Path, "open", blocking_open):
+                with mock.patch.object(os, "read", blocking_read):
                     with self.assertRaises(WorkerTimeout):
-                        _copy_regular_input_from_scope(
+                        _stage_regular_input_anonymous_bounded(
                             scope_fd,
                             Path("in.wav"),
-                            target,
                             max_bytes=1024,
                             deadline=time.monotonic() + 0.1,
                         )
             finally:
                 os.close(scope_fd)
             self.assertLess(time.monotonic() - started, 1.0)
-            self.assertFalse(target.exists())
 
     @unittest.skipUnless(os.name == "posix", "bounded scope transfer uses POSIX descriptors")
     def test_blocking_signed_scope_traversal_is_bounded(self):
@@ -808,13 +791,14 @@ class CapabilityBoundaryTests(unittest.TestCase):
                 )
         self.assertLess(time.monotonic() - started, 1.0)
 
-    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and hasattr(os, "memfd_create"),
+        "sealed anonymous input requires Linux memfd",
+    )
     def test_blocking_input_descriptor_preflight_is_bounded(self):
-        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
+        with tempfile.TemporaryDirectory() as allowed:
             root = Path(allowed).resolve()
-            source = root / "in.wav"
-            source.write_bytes(b"audio")
-            target = Path(staging) / "staged.wav"
+            (root / "in.wav").write_bytes(b"audio")
             scope_fd = _open_directory_no_symlinks(root)
             real_open = os.open
 
@@ -827,10 +811,9 @@ class CapabilityBoundaryTests(unittest.TestCase):
             try:
                 with mock.patch.object(os, "open", blocking_open):
                     with self.assertRaises(WorkerTimeout):
-                        _copy_regular_input_from_scope(
+                        _stage_regular_input_anonymous_bounded(
                             scope_fd,
                             Path("in.wav"),
-                            target,
                             max_bytes=1024,
                             deadline=time.monotonic() + 0.1,
                         )
@@ -838,36 +821,36 @@ class CapabilityBoundaryTests(unittest.TestCase):
                 os.close(scope_fd)
             self.assertLess(time.monotonic() - started, 1.0)
 
-    @unittest.skipUnless(os.name == "posix", "bounded I/O child uses POSIX fork")
-    def test_input_timeout_does_not_probe_or_unlink_staging_target_in_parent(self):
-        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging:
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and hasattr(os, "memfd_create"),
+        "sealed anonymous input requires Linux memfd",
+    )
+    def test_input_timeout_has_no_parent_filesystem_cleanup_path(self):
+        with tempfile.TemporaryDirectory() as allowed:
             root = Path(allowed).resolve()
             (root / "in.wav").write_bytes(b"audio")
-            target = Path(staging) / "staged.wav"
             scope_fd = _open_directory_no_symlinks(root)
-            real_open = Path.open
+            real_read = os.read
             parent_pid = os.getpid()
 
-            def blocking_target_open(path, *args, **kwargs):
-                if Path(path) == target:
-                    time.sleep(5)
-                return real_open(path, *args, **kwargs)
+            def blocking_read(*args, **kwargs):
+                time.sleep(5)
+                return real_read(*args, **kwargs)
 
-            def forbidden_parent_probe(path, *args, **kwargs):
-                if os.getpid() == parent_pid and Path(path) == target:
-                    raise AssertionError("staging target probed by parent")
+            def forbidden_parent_path_call(*args, **kwargs):
+                if os.getpid() == parent_pid:
+                    raise AssertionError("parent filesystem cleanup path executed")
                 return False
 
             started = time.monotonic()
             try:
-                with mock.patch.object(Path, "open", blocking_target_open), mock.patch.object(
-                    Path, "is_file", forbidden_parent_probe
-                ):
+                with mock.patch.object(os, "read", blocking_read), mock.patch.object(
+                    Path, "is_file", forbidden_parent_path_call
+                ), mock.patch.object(Path, "unlink", forbidden_parent_path_call):
                     with self.assertRaises(WorkerTimeout):
-                        _copy_regular_input_from_scope(
+                        _stage_regular_input_anonymous_bounded(
                             scope_fd,
                             Path("in.wav"),
-                            target,
                             max_bytes=1024,
                             deadline=time.monotonic() + 0.1,
                         )
