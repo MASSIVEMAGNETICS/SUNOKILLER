@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Iterator, Mapping, Optional, Set
 
 from .contracts import LeaseExpired, LeaseRevoked, canonical_json, digest_json
@@ -59,9 +60,18 @@ class StateSnapshot:
 
 class SQLiteStateStore:
     def __init__(self, path: str) -> None:
-        self.path = path
+        if path == ":memory:":
+            self.path = path
+            self._bounded_path = None
+        else:
+            self.path = str(Path(path).expanduser().resolve())
+            self._bounded_path = self.path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._conn = sqlite3.connect(
+            self.path,
+            check_same_thread=False,
+            isolation_level=None,
+        )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(
@@ -84,6 +94,11 @@ class SQLiteStateStore:
             );
             """
         )
+        if self._bounded_path is None:
+            self._bounded_identity = None
+        else:
+            info = os.stat(self._bounded_path)
+            self._bounded_identity = (info.st_dev, info.st_ino)
 
     @staticmethod
     def _assert_deadline(deadline_monotonic: Optional[float]) -> None:
@@ -172,6 +187,10 @@ class SQLiteStateStore:
             raise StateDeadlineExceeded(
                 "deadline-bound state reads require POSIX process isolation in v0.1"
             )
+        if self._bounded_path is None or self._bounded_identity is None:
+            raise StateDeadlineExceeded(
+                "bounded execution requires a stable file-backed state store"
+            )
         self._assert_deadline(deadline_monotonic)
 
         parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -182,12 +201,18 @@ class SQLiteStateStore:
             try:
                 # Never use the inherited connection or parent RLock after fork.
                 connection = sqlite3.connect(
-                    self.path,
+                    self._bounded_path,
                     check_same_thread=False,
                     isolation_level=None,
                     timeout=0.0,
                 )
                 connection.execute("PRAGMA query_only=ON")
+                database_row = connection.execute("PRAGMA database_list").fetchone()
+                if database_row is None or not database_row[2]:
+                    os._exit(3)
+                database_info = os.stat(database_row[2])
+                if (database_info.st_dev, database_info.st_ino) != self._bounded_identity:
+                    os._exit(3)
                 row = connection.execute(query, (parameter,)).fetchone()
                 value = None if row is None else row[0]
                 encoded = json.dumps(

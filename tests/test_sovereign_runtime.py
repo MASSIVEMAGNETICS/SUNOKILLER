@@ -12,6 +12,7 @@ import time
 import unittest
 from unittest import mock
 
+import sunokiller.runtime.contracts as contracts_module
 import sunokiller.runtime.runner as runner_module
 from sunokiller.runtime import HMACAuthority, IsolatedRunner, SQLiteStateStore, WorkerSpec
 from sunokiller.runtime.contracts import (
@@ -152,6 +153,27 @@ class CapabilityBoundaryTests(unittest.TestCase):
                 resource="catalog/masters/x.wav",
             )
 
+    def test_oversized_forged_lease_is_rejected_before_copy_hash_or_state_read(self):
+        lease = dataclasses.replace(
+            self.issue(),
+            metadata={"attacker": "x" * (65 * 1024)},
+        )
+        with mock.patch.object(
+            contracts_module.json,
+            "dumps",
+            side_effect=AssertionError("oversized lease must fail before JSON encoding"),
+        ), mock.patch.object(
+            self.store,
+            "is_revoked",
+            side_effect=AssertionError("forged lease must not trigger SQLite I/O"),
+        ):
+            with self.assertRaises(InvalidSignature):
+                self.runner().execute(
+                    lease=lease,
+                    worker=self.demo_worker(),
+                    payload={"value": 4},
+                )
+
     def test_state_mismatch_rejected(self):
         first = self.store.save_snapshot("runtime", {"v": 1})
         self.store.save_snapshot("runtime", {"v": 2}, expected_hash=first.state_hash)
@@ -272,6 +294,10 @@ class CapabilityBoundaryTests(unittest.TestCase):
             "_run_worker",
             side_effect=AssertionError("oversized payload must not launch"),
         ), mock.patch.object(
+            runner_module.os,
+            "fork",
+            side_effect=AssertionError("oversized payload must fail before fork"),
+        ), mock.patch.object(
             runner_module.json.JSONEncoder,
             "iterencode",
             side_effect=AssertionError("oversized string must fail before JSON encoding"),
@@ -284,6 +310,73 @@ class CapabilityBoundaryTests(unittest.TestCase):
                 )
         self.assertLess(time.monotonic() - started, 1.0)
         self.assertIsNone(self.store.load_latest("runtime"))
+
+    @unittest.skipUnless(os.name == "posix", "killable state reads require POSIX")
+    def test_bounded_reads_remain_bound_to_original_database_after_cwd_change(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            origin = root / "origin"
+            decoy = root / "decoy"
+            origin.mkdir()
+            decoy.mkdir()
+            old_cwd = os.getcwd()
+            bound_store = None
+            decoy_store = None
+            try:
+                os.chdir(origin)
+                bound_store = SQLiteStateStore("runtime.sqlite3")
+                lease = self.issue()
+                bound_store.revoke_lease(lease.lease_id, "human stop")
+
+                os.chdir(decoy)
+                decoy_store = SQLiteStateStore("runtime.sqlite3")
+                decoy_store.close()
+                decoy_store = None
+                runner = IsolatedRunner(
+                    authority=self.authority,
+                    state_store=bound_store,
+                    state_key="runtime",
+                )
+                with mock.patch.object(
+                    IsolatedRunner,
+                    "_run_worker",
+                    side_effect=AssertionError("revoked worker must not launch"),
+                ):
+                    with self.assertRaises(LeaseRevoked):
+                        runner.execute(
+                            lease=lease,
+                            worker=self.demo_worker(),
+                            payload={"value": 4},
+                        )
+            finally:
+                os.chdir(old_cwd)
+                if decoy_store is not None:
+                    decoy_store.close()
+                if bound_store is not None:
+                    bound_store.close()
+
+    @unittest.skipUnless(os.name == "posix", "killable state reads require POSIX")
+    def test_in_memory_state_store_fails_closed_for_bounded_execution(self):
+        memory_store = SQLiteStateStore(":memory:")
+        try:
+            runner = IsolatedRunner(
+                authority=self.authority,
+                state_store=memory_store,
+                state_key="runtime",
+            )
+            with mock.patch.object(
+                IsolatedRunner,
+                "_run_worker",
+                side_effect=AssertionError("worker must not launch without bound state identity"),
+            ):
+                with self.assertRaises(WorkerTimeout):
+                    runner.execute(
+                        lease=self.issue(),
+                        worker=self.demo_worker(),
+                        payload={"value": 4},
+                    )
+        finally:
+            memory_store.close()
 
     @unittest.skipUnless(os.name == "posix", "killable state reads require POSIX")
     def test_blocking_sqlite_read_cannot_delay_human_stop_deadline(self):

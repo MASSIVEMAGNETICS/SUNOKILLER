@@ -20,11 +20,15 @@ import uuid
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .contracts import (
+    CanonicalJSONInvalid,
+    CanonicalJSONTooLarge,
     CapabilityLease,
     ExecutionReceipt,
     HMACAuthority,
+    LeaseRevoked,
     ResourceDenied,
     digest_json,
+    preflight_canonical_json_size,
 )
 from .state import NO_SNAPSHOT_PRECONDITION, SQLiteStateStore, StateDeadlineExceeded
 
@@ -359,12 +363,23 @@ def _canonicalize_payload_bounded(
     if max_bytes <= 0:
         raise WorkerExecutionError("trusted payload byte limit must be positive")
 
+    # Reject attacker-sized built-in strings/containers before socket or fork
+    # setup. The child repeats this check on its immutable post-fork snapshot.
+    try:
+        preflight_canonical_json_size(payload, max_bytes=max_bytes)
+    except CanonicalJSONTooLarge as exc:
+        raise ResourceDenied("payload exceeded its trusted byte limit") from exc
+    except CanonicalJSONInvalid as exc:
+        raise WorkerExecutionError(
+            "payload must be a JSON object within the trusted byte limit"
+        ) from exc
+
     parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     pid = os.fork()
     if pid == 0:
         parent_sock.close()
         try:
-            _preflight_json_size(payload, max_bytes=max_bytes)
+            preflight_canonical_json_size(payload, max_bytes=max_bytes)
             encoder = json.JSONEncoder(
                 sort_keys=True,
                 separators=(",", ":"),
@@ -378,7 +393,7 @@ def _canonicalize_payload_bounded(
                     os._exit(2)
                 child_sock.sendall(encoded)
             os._exit(0)
-        except ResourceDenied:
+        except CanonicalJSONTooLarge:
             os._exit(2)
         except BaseException:
             os._exit(1)
@@ -438,97 +453,6 @@ def _canonicalize_payload_bounded(
     if not isinstance(normalized, dict):
         raise WorkerExecutionError("payload must be a JSON object")
     return normalized, sha256(raw).hexdigest()
-
-
-def _preflight_json_size(value: Any, *, max_bytes: int) -> int:
-    """Count canonical JSON bytes without allocating an encoded string token."""
-    active = set()
-
-    def add(total: int, amount: int) -> int:
-        total += amount
-        if total > max_bytes:
-            raise ResourceDenied("payload exceeded its trusted byte limit")
-        return total
-
-    def string_size(text: str, total: int) -> int:
-        total = add(total, 2)
-        if len(text) + total > max_bytes:
-            raise ResourceDenied("payload exceeded its trusted byte limit")
-        for character in text:
-            codepoint = ord(character)
-            if character in ('"', "\\") or character in "\b\f\n\r\t":
-                width = 2
-            elif codepoint < 0x20:
-                width = 6
-            elif codepoint < 0x80:
-                width = 1
-            elif codepoint < 0x800:
-                width = 2
-            elif 0xD800 <= codepoint <= 0xDFFF:
-                raise ValueError("payload contains an unpaired surrogate")
-            elif codepoint < 0x10000:
-                width = 3
-            else:
-                width = 4
-            total = add(total, width)
-        return total
-
-    def measure(item: Any, total: int, depth: int) -> int:
-        if depth > 64:
-            raise ValueError("payload nesting exceeds the trusted depth limit")
-        if item is None:
-            return add(total, 4)
-        if item is True:
-            return add(total, 4)
-        if item is False:
-            return add(total, 5)
-        if type(item) is str:
-            return string_size(item, total)
-        if type(item) is int:
-            # A binary integer larger than the entire byte budget cannot have a
-            # valid decimal JSON representation within that budget.
-            if item.bit_length() > max_bytes * 4:
-                raise ResourceDenied("payload exceeded its trusted byte limit")
-            return add(total, len(str(item)))
-        if type(item) is float:
-            if not math.isfinite(item):
-                raise ValueError("payload contains a non-finite number")
-            return add(total, len(repr(item)))
-        if type(item) is dict:
-            identity = id(item)
-            if identity in active:
-                raise ValueError("payload contains a circular reference")
-            active.add(identity)
-            try:
-                total = add(total, 2)
-                for index, (key, nested) in enumerate(item.items()):
-                    if type(key) is not str:
-                        raise ValueError("payload object keys must be strings")
-                    if index:
-                        total = add(total, 1)
-                    total = string_size(key, total)
-                    total = add(total, 1)
-                    total = measure(nested, total, depth + 1)
-                return total
-            finally:
-                active.remove(identity)
-        if type(item) in (list, tuple):
-            identity = id(item)
-            if identity in active:
-                raise ValueError("payload contains a circular reference")
-            active.add(identity)
-            try:
-                total = add(total, 2)
-                for index, nested in enumerate(item):
-                    if index:
-                        total = add(total, 1)
-                    total = measure(nested, total, depth + 1)
-                return total
-            finally:
-                active.remove(identity)
-        raise ValueError("payload contains a non-JSON value")
-
-    return measure(value, 0, 0)
 
 
 def _open_directory_bounded(path: Path, *, deadline: float) -> int:
@@ -1043,11 +967,22 @@ class IsolatedRunner:
         deadline: Optional[float] = None,
     ) -> WorkerPolicy:
         policy = policy or self._policy_for(worker)
+        try:
+            # Authenticate and structurally bound the lease before it can
+            # trigger SQLite reads or error rendering in the parent.
+            self.authority.verify_lease(
+                lease,
+                required_capability=policy.capability,
+                resource=policy.logical_resource,
+                revoked_ids=(),
+                resource_kind="logical",
+            )
+        except (CanonicalJSONTooLarge, CanonicalJSONInvalid) as exc:
+            raise WorkerExecutionError("lease failed its bounded signing contract") from exc
+
         if lease.subject != policy.worker_id:
             raise WorkerExecutionError(
-                "signed lease subject {} does not authorize worker {}".format(
-                    lease.subject, policy.worker_id
-                )
+                "signed lease subject does not authorize the registered worker"
             )
 
         try:
@@ -1059,13 +994,8 @@ class IsolatedRunner:
             raise WorkerTimeout(
                 "end-to-end execution deadline expired during authority check"
             ) from exc
-        self.authority.verify_lease(
-            lease,
-            required_capability=policy.capability,
-            resource=policy.logical_resource,
-            revoked_ids={lease.lease_id} if revoked else (),
-            resource_kind="logical",
-        )
+        if revoked:
+            raise LeaseRevoked("lease has been revoked")
 
         for field in policy.filesystem_fields:
             raw_value = payload.get(field)

@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 import hmac
 import json
+import math
 from pathlib import Path
 import secrets
 import time
@@ -38,6 +39,112 @@ class CapabilityDenied(LeaseError):
 
 class ResourceDenied(LeaseError):
     pass
+
+
+class CanonicalJSONTooLarge(ValueError):
+    pass
+
+
+class CanonicalJSONInvalid(ValueError):
+    pass
+
+
+SIGNED_PAYLOAD_MAX_BYTES = 64 * 1024
+
+
+def preflight_canonical_json_size(value: Any, *, max_bytes: int) -> int:
+    """Count canonical UTF-8 JSON bytes without allocating encoded string tokens."""
+    active = set()
+
+    def add(total: int, amount: int) -> int:
+        total += amount
+        if total > max_bytes:
+            raise CanonicalJSONTooLarge("canonical JSON exceeds its trusted byte limit")
+        return total
+
+    def string_size(text: str, total: int) -> int:
+        total = add(total, 2)
+        if len(text) + total > max_bytes:
+            raise CanonicalJSONTooLarge("canonical JSON exceeds its trusted byte limit")
+        for character in text:
+            codepoint = ord(character)
+            if character in ('"', "\\") or character in "\b\f\n\r\t":
+                width = 2
+            elif codepoint < 0x20:
+                width = 6
+            elif codepoint < 0x80:
+                width = 1
+            elif codepoint < 0x800:
+                width = 2
+            elif 0xD800 <= codepoint <= 0xDFFF:
+                raise CanonicalJSONInvalid("canonical JSON contains an unpaired surrogate")
+            elif codepoint < 0x10000:
+                width = 3
+            else:
+                width = 4
+            total = add(total, width)
+        return total
+
+    def measure(item: Any, total: int, depth: int) -> int:
+        if depth > 64:
+            raise CanonicalJSONInvalid("canonical JSON exceeds the trusted depth limit")
+        if item is None:
+            return add(total, 4)
+        if item is True:
+            return add(total, 4)
+        if item is False:
+            return add(total, 5)
+        if type(item) is str:
+            return string_size(item, total)
+        if type(item) is int:
+            if item.bit_length() > max_bytes * 4:
+                raise CanonicalJSONTooLarge(
+                    "canonical JSON exceeds its trusted byte limit"
+                )
+            return add(total, len(str(item)))
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise CanonicalJSONInvalid("canonical JSON contains a non-finite number")
+            return add(total, len(repr(item)))
+        if type(item) is dict:
+            identity = id(item)
+            if identity in active:
+                raise CanonicalJSONInvalid("canonical JSON contains a circular reference")
+            active.add(identity)
+            try:
+                total = add(total, 2)
+                for index, (key, nested) in enumerate(item.items()):
+                    if type(key) is not str:
+                        raise CanonicalJSONInvalid(
+                            "canonical JSON object keys must be strings"
+                        )
+                    if index:
+                        total = add(total, 1)
+                    total = string_size(key, total)
+                    total = add(total, 1)
+                    total = measure(nested, total, depth + 1)
+                return total
+            finally:
+                active.remove(identity)
+        if type(item) in (list, tuple):
+            identity = id(item)
+            if identity in active:
+                raise CanonicalJSONInvalid("canonical JSON contains a circular reference")
+            active.add(identity)
+            try:
+                total = add(total, 2)
+                for index, nested in enumerate(item):
+                    if index:
+                        total = add(total, 1)
+                    total = measure(nested, total, depth + 1)
+                return total
+            finally:
+                active.remove(identity)
+        raise CanonicalJSONInvalid("canonical JSON contains a non-JSON value")
+
+    if max_bytes <= 0:
+        raise CanonicalJSONInvalid("canonical JSON byte limit must be positive")
+    return measure(value, 0, 0)
 
 
 def canonical_json(value: Any) -> str:
@@ -103,10 +210,20 @@ class CapabilityLease:
     signature: str = ""
 
     def unsigned_payload(self) -> Dict[str, Any]:
-        data = asdict(self)
-        data.pop("signature", None)
-        data["metadata"] = dict(self.metadata)
-        return data
+        # Keep this shallow and fixed-shape. Verification preflights every
+        # referenced value before canonical serialization; dataclasses.asdict
+        # would recursively copy attacker-sized metadata first.
+        return {
+            "lease_id": self.lease_id,
+            "issuer": self.issuer,
+            "subject": self.subject,
+            "capabilities": self.capabilities,
+            "resource_scopes": self.resource_scopes,
+            "not_before": self.not_before,
+            "expires_at": self.expires_at,
+            "nonce": self.nonce,
+            "metadata": self.metadata,
+        }
 
     def with_signature(self, signature: str) -> "CapabilityLease":
         return CapabilityLease(**dict(self.unsigned_payload(), signature=signature))
@@ -161,6 +278,10 @@ class HMACAuthority:
         return secrets.token_hex(32)
 
     def _sign_payload(self, payload: Mapping[str, Any]) -> str:
+        preflight_canonical_json_size(
+            payload,
+            max_bytes=SIGNED_PAYLOAD_MAX_BYTES,
+        )
         return hmac.new(
             self._secret,
             canonical_json(dict(payload)).encode("utf-8"),
@@ -203,7 +324,14 @@ class HMACAuthority:
         revoked_ids: Iterable[str] = (),
         resource_kind: str = "logical",
     ) -> None:
-        expected = self._sign_payload(lease.unsigned_payload())
+        if type(lease.signature) is not str or len(lease.signature) != 64:
+            raise InvalidSignature("lease signature has an invalid representation")
+        try:
+            expected = self._sign_payload(lease.unsigned_payload())
+        except (CanonicalJSONTooLarge, CanonicalJSONInvalid) as exc:
+            raise InvalidSignature(
+                "lease representation exceeds the trusted signing contract"
+            ) from exc
         if not hmac.compare_digest(expected, lease.signature):
             raise InvalidSignature("lease signature mismatch")
         if lease.issuer != self.issuer:
