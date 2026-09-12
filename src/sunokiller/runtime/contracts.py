@@ -324,6 +324,8 @@ class HMACAuthority:
         revoked_ids: Iterable[str] = (),
         resource_kind: str = "logical",
     ) -> None:
+        if type(lease) is not CapabilityLease:
+            raise InvalidSignature("lease must use the trusted contract type")
         if type(lease.signature) is not str or len(lease.signature) != 64:
             raise InvalidSignature("lease signature has an invalid representation")
         try:

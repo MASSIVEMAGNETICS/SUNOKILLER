@@ -54,7 +54,7 @@ This branch implements a deliberately narrow, local-first execution candidate fo
 | OMEN command contract | Hard 48 kHz plus EBU R128 `loudnorm`; supported suffix selects codec |
 | OMEN 44.1 kHz override | Reject |
 
-`tests/test_sovereign_runtime.py` defines 44 unit/security-contract tests. The suite includes adversarial and fault-injection coverage for pre-fork payload rejection, bounded forged-lease verification, database-identity binding, killably supervised SQLite reads, authority checks, STOP/revocation races, process-group teardown, descriptor traversal, empty sealed dry-run tokens, parent-free timeout recovery, deterministic nested path restoration, lexical output scope, prohibited state transactions, prohibited native FFmpeg execution, and prohibited public publication.
+`tests/test_sovereign_runtime.py` defines 45 unit/security-contract tests. The suite includes adversarial and fault-injection coverage for pre-fork payload rejection, bounded forged-lease verification, database-identity binding, killably supervised SQLite reads, authority checks, STOP/revocation races, process-group teardown, descriptor traversal, empty sealed dry-run tokens, parent-free timeout recovery, deterministic nested path restoration, lexical output scope, prohibited state transactions, prohibited native FFmpeg execution, and prohibited public publication.
 
 ## OMEN dry-run worker
 

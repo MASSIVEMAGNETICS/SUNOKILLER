@@ -842,7 +842,15 @@ class _FilesystemStager:
             if isinstance(value, list):
                 return [restore(item) for item in value]
             if isinstance(value, dict):
-                return {key: restore(item) for key, item in value.items()}
+                restored = {}
+                for key, item in value.items():
+                    restored_key = restore(key)
+                    if restored_key in restored:
+                        raise WorkerExecutionError(
+                            "descriptor restoration produced a duplicate result key"
+                        )
+                    restored[restored_key] = restore(item)
+                return restored
             return value
 
         return restore(dict(result))
@@ -967,23 +975,7 @@ class IsolatedRunner:
         deadline: Optional[float] = None,
     ) -> WorkerPolicy:
         policy = policy or self._policy_for(worker)
-        try:
-            # Authenticate and structurally bound the lease before it can
-            # trigger SQLite reads or error rendering in the parent.
-            self.authority.verify_lease(
-                lease,
-                required_capability=policy.capability,
-                resource=policy.logical_resource,
-                revoked_ids=(),
-                resource_kind="logical",
-            )
-        except (CanonicalJSONTooLarge, CanonicalJSONInvalid) as exc:
-            raise WorkerExecutionError("lease failed its bounded signing contract") from exc
-
-        if lease.subject != policy.worker_id:
-            raise WorkerExecutionError(
-                "signed lease subject does not authorize the registered worker"
-            )
+        self._verify_signed_lease(lease=lease, policy=policy)
 
         try:
             revoked = self.state_store.is_revoked(
@@ -1005,6 +997,30 @@ class IsolatedRunner:
                 )
             _select_signed_filesystem_scope(lease, raw_value)
         return policy
+
+    def _verify_signed_lease(
+        self,
+        *,
+        lease: CapabilityLease,
+        policy: WorkerPolicy,
+    ) -> None:
+        try:
+            # Authenticate and structurally bound the lease before it can
+            # trigger SQLite reads or error rendering in the parent.
+            self.authority.verify_lease(
+                lease,
+                required_capability=policy.capability,
+                resource=policy.logical_resource,
+                revoked_ids=(),
+                resource_kind="logical",
+            )
+        except (CanonicalJSONTooLarge, CanonicalJSONInvalid) as exc:
+            raise WorkerExecutionError("lease failed its bounded signing contract") from exc
+
+        if lease.subject != policy.worker_id:
+            raise WorkerExecutionError(
+                "signed lease subject does not authorize the registered worker"
+            )
 
     def _run_worker(
         self,
@@ -1071,6 +1087,9 @@ class IsolatedRunner:
         limits = self._validated_limits(worker, policy)
         deadline = time.monotonic() + float(limits["timeout_seconds"])
         started = int(time.time())
+        # Bound and authenticate the lease before any helper fork. Otherwise an
+        # attacker-sized forged lease would still inflate fork/page-table cost.
+        self._verify_signed_lease(lease=lease, policy=policy)
         input_payload, input_hash = _canonicalize_payload_bounded(
             payload,
             max_bytes=policy.max_payload_bytes,

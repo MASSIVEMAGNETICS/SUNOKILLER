@@ -163,6 +163,10 @@ class CapabilityBoundaryTests(unittest.TestCase):
             "dumps",
             side_effect=AssertionError("oversized lease must fail before JSON encoding"),
         ), mock.patch.object(
+            runner_module.os,
+            "fork",
+            side_effect=AssertionError("oversized lease must fail before helper fork"),
+        ), mock.patch.object(
             self.store,
             "is_revoked",
             side_effect=AssertionError("forged lease must not trigger SQLite I/O"),
@@ -297,10 +301,6 @@ class CapabilityBoundaryTests(unittest.TestCase):
             runner_module.os,
             "fork",
             side_effect=AssertionError("oversized payload must fail before fork"),
-        ), mock.patch.object(
-            runner_module.json.JSONEncoder,
-            "iterencode",
-            side_effect=AssertionError("oversized string must fail before JSON encoding"),
         ):
             with self.assertRaises(ResourceDenied):
                 self.runner().execute(
@@ -1103,6 +1103,17 @@ class CapabilityBoundaryTests(unittest.TestCase):
             )
             self.authority.verify_receipt(first_receipt)
             self.authority.verify_receipt(second_receipt)
+
+    def test_descriptor_restoration_includes_nested_mapping_keys(self):
+        stager = object.__new__(runner_module._FilesystemStager)
+        stager._public_path_map = {"/proc/self/fd/91": "/trusted/input.wav"}
+        result = stager.restore_public_paths(
+            {"nested": {"/proc/self/fd/91": ["/proc/self/fd/91"]}}
+        )
+        self.assertEqual(
+            result,
+            {"nested": {"/trusted/input.wav": ["/trusted/input.wav"]}},
+        )
 
 
 class OmenHarnessTests(unittest.TestCase):

@@ -200,11 +200,13 @@ class SQLiteStateStore:
             connection = None
             try:
                 # Never use the inherited connection or parent RLock after fork.
+                database_uri = Path(self._bounded_path).as_uri() + "?mode=ro"
                 connection = sqlite3.connect(
-                    self._bounded_path,
+                    database_uri,
                     check_same_thread=False,
                     isolation_level=None,
                     timeout=0.0,
+                    uri=True,
                 )
                 connection.execute("PRAGMA query_only=ON")
                 database_row = connection.execute("PRAGMA database_list").fetchone()
