@@ -1045,11 +1045,10 @@ class IsolatedRunner:
             proposed_state = result.pop("_state", None)
             output_commit_linearized = False
 
-            # File-producing workers write only into the private staging area.
-            # The actual publish step is short and runs while SQLite holds the
-            # lease commit guard, so a concurrent Human STOP either commits
-            # before publication (and blocks it) or after the authorized file
-            # replacement has fully completed.
+            # File-producing workers write only into descriptor-retained private
+            # staging. Bounded v0.1 enters the durable lease guard but then
+            # refuses public publication; a future receipt-linked publisher
+            # must preserve this authority recheck without widening the gate.
             if policy.filesystem_outputs and not input_payload.get("dry_run"):
                 try:
                     with self.state_store.lease_commit_guard(
