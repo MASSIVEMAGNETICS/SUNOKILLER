@@ -214,6 +214,26 @@ class CapabilityBoundaryTests(unittest.TestCase):
         self.assertIsInstance(failures[0], LeaseExpired)
         self.assertIsNone(self.store.load_latest("expiry-runtime"))
 
+    def test_state_commit_respects_execution_deadline(self):
+        lease = self.issue()
+        worker = dataclasses.replace(self.demo_worker(), timeout_seconds=0.75)
+        blocker = sqlite3.connect(self.db_path, isolation_level=None)
+        blocker.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        try:
+            with self.assertRaises(WorkerTimeout):
+                self.runner().execute(
+                    lease=lease,
+                    worker=worker,
+                    payload={"value": 4},
+                )
+        finally:
+            blocker.execute("COMMIT")
+            blocker.close()
+
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertIsNone(self.store.load_latest("runtime"))
+
     def test_signed_lease_is_bound_to_exact_worker_code(self):
         lease = self.issue()
         with self.assertRaises(WorkerExecutionError):
@@ -625,6 +645,84 @@ class CapabilityBoundaryTests(unittest.TestCase):
                         },
                     )
             self.assertLess(time.monotonic() - started, 1.0)
+            self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.name == "posix", "descriptor-retained staging uses POSIX descriptors")
+    def test_staging_root_path_substitution_cannot_change_worker_input(self):
+        runner = self.runner()
+        omen_worker = self.omen_worker()
+        real_make = runner_module._make_private_staging_directory_bounded
+        retained = {}
+
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as staging_base:
+            root = Path(allowed).resolve()
+            source = root / "in.wav"
+            source.write_bytes(b"trusted-input")
+            output = root / "out.wav"
+            lease = self.authority.issue_lease(
+                subject=omen_worker.worker_id,
+                capabilities=["audio.master"],
+                resource_scopes=["catalog/masters", str(root)],
+            )
+
+            def substitute_returned_path(*, deadline):
+                parent_fd, root_fd, name = real_make(deadline=deadline)
+                retained_name = name + "-retained"
+                os.rename(name, retained_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+                replacement_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    attacker_fd = os.open(
+                        "input-0.wav",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=replacement_fd,
+                    )
+                    try:
+                        os.write(attacker_fd, b"attacker-substitute")
+                    finally:
+                        os.close(attacker_fd)
+                finally:
+                    os.close(replacement_fd)
+                retained["original"] = Path(staging_base) / retained_name
+                retained["replacement"] = Path(staging_base) / name
+                return parent_fd, root_fd, name
+
+            with mock.patch.object(
+                tempfile, "tempdir", str(Path(staging_base).resolve())
+            ), mock.patch.object(
+                runner_module,
+                "_make_private_staging_directory_bounded",
+                side_effect=substitute_returned_path,
+            ), mock.patch.object(
+                runner_module,
+                "_remove_private_staging_directory_bounded",
+                return_value=None,
+            ):
+                result, receipt = runner.execute(
+                    lease=lease,
+                    worker=omen_worker,
+                    payload={
+                        "input_path": str(source),
+                        "output_path": str(output),
+                        "dry_run": True,
+                    },
+                )
+
+            self.assertEqual(result["status"], "DRY_RUN")
+            self.authority.verify_receipt(receipt)
+            self.assertEqual(
+                (retained["original"] / "input-0.wav").read_bytes(),
+                b"trusted-input",
+            )
+            self.assertEqual(
+                (retained["replacement"] / "input-0.wav").read_bytes(),
+                b"attacker-substitute",
+            )
             self.assertFalse(output.exists())
 
     @unittest.skipUnless(os.name == "posix", "disabled output path contract is POSIX v0.1")
