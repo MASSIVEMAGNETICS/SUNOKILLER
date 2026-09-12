@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import array
+from hashlib import sha256
 import json
 import math
 import os
@@ -14,7 +15,6 @@ import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -65,6 +65,7 @@ class WorkerPolicy:
     max_timeout_seconds: float
     max_memory_mb: int
     max_cpu_seconds: int
+    max_payload_bytes: int = 64 * 1024
     filesystem_inputs: Tuple[str, ...] = ()
     filesystem_outputs: Tuple[str, ...] = ()
     max_input_bytes: int = 0
@@ -344,6 +345,98 @@ def _wait_bounded_io_child(
         time.sleep(0.01)
 
 
+def _canonicalize_payload_bounded(
+    payload: Mapping[str, Any],
+    *,
+    max_bytes: int,
+    deadline: float,
+) -> Tuple[Dict[str, Any], str]:
+    """Canonicalize untrusted payload data in a killable, size-bounded child."""
+    if os.name != "posix" or not hasattr(os, "fork"):
+        raise WorkerExecutionError(
+            "bounded payload canonicalization requires POSIX process isolation in v0.1"
+        )
+    if max_bytes <= 0:
+        raise WorkerExecutionError("trusted payload byte limit must be positive")
+
+    parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    pid = os.fork()
+    if pid == 0:
+        parent_sock.close()
+        try:
+            encoder = json.JSONEncoder(
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            total = 0
+            for text_chunk in encoder.iterencode(payload):
+                encoded = text_chunk.encode("utf-8")
+                total += len(encoded)
+                if total > max_bytes:
+                    os._exit(2)
+                child_sock.sendall(encoded)
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+
+    child_sock.close()
+    parent_sock.setblocking(False)
+    chunks = []
+    total = 0
+    try:
+        while True:
+            try:
+                chunk = parent_sock.recv(64 * 1024)
+                if chunk:
+                    total += len(chunk)
+                    if total > max_bytes:
+                        _bounded_kill_and_reap(pid)
+                        raise ResourceDenied("payload exceeded its trusted byte limit")
+                    chunks.append(chunk)
+            except BlockingIOError:
+                pass
+
+            completed, status = os.waitpid(pid, os.WNOHANG)
+            if completed == pid:
+                while True:
+                    try:
+                        chunk = parent_sock.recv(64 * 1024)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ResourceDenied("payload exceeded its trusted byte limit")
+                    chunks.append(chunk)
+                if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2:
+                    raise ResourceDenied("payload exceeded its trusted byte limit")
+                if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                    raise WorkerExecutionError(
+                        "payload must be a JSON object within the trusted byte limit"
+                    )
+                break
+
+            if time.monotonic() >= deadline:
+                _bounded_kill_and_reap(pid)
+                raise WorkerTimeout(
+                    "payload canonicalization exceeded end-to-end deadline"
+                )
+            time.sleep(0.01)
+    finally:
+        parent_sock.close()
+
+    raw = b"".join(chunks)
+    try:
+        normalized = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkerExecutionError("payload canonicalization returned invalid JSON") from exc
+    if not isinstance(normalized, dict):
+        raise WorkerExecutionError("payload must be a JSON object")
+    return normalized, sha256(raw).hexdigest()
+
+
 def _open_directory_bounded(path: Path, *, deadline: float) -> int:
     """Open a signed scope in a killable child and transfer only the verified fd."""
     parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -393,52 +486,51 @@ def _open_directory_bounded(path: Path, *, deadline: float) -> int:
         parent_sock.close()
 
 
-def _make_private_staging_directory_bounded(
+def _require_linux_anonymous_staging() -> None:
+    if (
+        not sys.platform.startswith("linux")
+        or not hasattr(os, "memfd_create")
+        or not hasattr(os, "MFD_ALLOW_SEALING")
+    ):
+        raise WorkerExecutionError(
+            "secure anonymous filesystem staging requires Linux memfd sealing in v0.1"
+        )
+
+
+def _required_input_seals() -> int:
+    import fcntl
+
+    return (
+        fcntl.F_SEAL_SEAL
+        | fcntl.F_SEAL_SHRINK
+        | fcntl.F_SEAL_GROW
+        | fcntl.F_SEAL_WRITE
+    )
+
+
+def _anonymous_descriptor_path(fd: int) -> str:
+    _require_linux_anonymous_staging()
+    return "/proc/self/fd/{}".format(fd)
+
+
+def _receive_anonymous_fd_bounded(
+    parent_sock: socket.socket,
+    pid: int,
     *,
     deadline: float,
-) -> Tuple[int, int, str]:
-    """Create staging in a child and retain verified parent/root descriptors."""
-    parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
-    pid = os.fork()
-    if pid == 0:
-        parent_sock.close()
-        parent_fd = None
-        root_fd = None
-        try:
-            created = Path(tempfile.mkdtemp(prefix="sunokiller-runtime-"))
-            parent_fd = _open_directory_no_symlinks(created.parent)
-            root_fd = os.open(
-                created.name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=parent_fd,
-            )
-            info = os.fstat(root_fd)
-            if (
-                not stat.S_ISDIR(info.st_mode)
-                or info.st_uid != os.geteuid()
-                or stat.S_IMODE(info.st_mode) & 0o077
-            ):
-                os._exit(3)
-            name_bytes = os.fsencode(created.name)
-            if not name_bytes or len(name_bytes) > 255:
-                os._exit(2)
-            rights = array.array("i", [parent_fd, root_fd])
-            child_sock.sendmsg(
-                [b"D" + name_bytes],
-                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
-            )
-            os._exit(0)
-        except BaseException:
-            os._exit(1)
+    operation: str,
+    require_sealed: bool,
+    max_bytes: int,
+) -> int:
+    import fcntl
 
-    child_sock.close()
     parent_sock.setblocking(False)
-    control_size = socket.CMSG_SPACE(2 * array.array("i").itemsize)
+    control_size = socket.CMSG_SPACE(array.array("i").itemsize)
     try:
         while True:
             try:
-                data, ancdata, _, _ = parent_sock.recvmsg(256, control_size)
-                if data[:1] == b"D":
+                data, ancdata, _, _ = parent_sock.recvmsg(1, control_size)
+                if data == b"F":
                     received = []
                     for level, kind, payload in ancdata:
                         if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
@@ -446,140 +538,161 @@ def _make_private_staging_directory_bounded(
                             usable = len(payload) - (len(payload) % rights.itemsize)
                             rights.frombytes(payload[:usable])
                             received.extend(rights.tolist())
-                    name = os.fsdecode(data[1:])
-                    if len(received) >= 2 and name not in ("", ".", "..") and "/" not in name:
+                    if len(received) == 1:
+                        received_fd = received[0]
                         _bounded_kill_and_reap(pid)
-                        for extra_fd in received[2:]:
-                            os.close(extra_fd)
-                        return received[0], received[1], name
+                        info = os.fstat(received_fd)
+                        if (
+                            not stat.S_ISREG(info.st_mode)
+                            or info.st_size > max_bytes
+                            or info.st_nlink != 0
+                        ):
+                            os.close(received_fd)
+                            raise ResourceDenied(
+                                "{} failed anonymous-file checks".format(operation)
+                            )
+                        if require_sealed:
+                            seals = fcntl.fcntl(received_fd, fcntl.F_GET_SEALS)
+                            required = _required_input_seals()
+                            if seals & required != required:
+                                os.close(received_fd)
+                                raise ResourceDenied(
+                                    "{} was not sealed before transfer".format(operation)
+                                )
+                        return received_fd
                     for received_fd in received:
                         os.close(received_fd)
                     raise WorkerExecutionError(
-                        "private staging descriptor transfer was invalid"
+                        "{} descriptor transfer was invalid".format(operation)
                     )
             except BlockingIOError:
                 pass
+
             completed, status = os.waitpid(pid, os.WNOHANG)
             if completed == pid:
                 if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2:
-                    raise WorkerExecutionError("private staging name exceeded transport limit")
+                    raise ResourceDenied(
+                        "{} exceeded its trusted byte limit".format(operation)
+                    )
                 if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 3:
-                    raise ResourceDenied("private staging directory permissions were unsafe")
-                raise WorkerExecutionError("private staging directory creation failed")
+                    raise ResourceDenied(
+                        "{} failed descriptor containment checks".format(operation)
+                    )
+                raise WorkerExecutionError(
+                    "{} failed in bounded anonymous staging child".format(operation)
+                )
             if time.monotonic() >= deadline:
                 _bounded_kill_and_reap(pid)
                 raise WorkerTimeout(
-                    "private staging directory creation exceeded end-to-end deadline"
+                    "{} exceeded end-to-end deadline".format(operation)
                 )
             time.sleep(0.01)
     finally:
         parent_sock.close()
 
 
-def _remove_private_staging_directory_bounded(
-    parent_fd: int,
-    root_fd: int,
-    name: str,
-) -> None:
-    """Erase staged files by descriptor and remove only the same directory inode."""
+def _make_anonymous_staging_file_bounded(
+    *,
+    label: str,
+    max_bytes: int,
+    deadline: float,
+) -> int:
+    """Create an unlinked memory-backed staging object in a bounded child."""
+    _require_linux_anonymous_staging()
+    parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
     pid = os.fork()
     if pid == 0:
+        parent_sock.close()
+        fd = None
         try:
-            for entry in os.listdir(root_fd):
-                info = os.stat(entry, dir_fd=root_fd, follow_symlinks=False)
-                if stat.S_ISDIR(info.st_mode):
-                    os.rmdir(entry, dir_fd=root_fd)
-                else:
-                    os.unlink(entry, dir_fd=root_fd)
-            root_info = os.fstat(root_fd)
-            entry_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if (
-                stat.S_ISDIR(entry_info.st_mode)
-                and root_info.st_dev == entry_info.st_dev
-                and root_info.st_ino == entry_info.st_ino
-            ):
-                os.rmdir(name, dir_fd=parent_fd)
+            flags = os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+            fd = os.memfd_create(label, flags=flags)
+            os.fchmod(fd, 0o600)
+            rights = array.array("i", [fd])
+            child_sock.sendmsg([b"F"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
             os._exit(0)
         except BaseException:
             os._exit(1)
 
-    try:
-        _wait_bounded_io_child(
-            pid,
-            deadline=time.monotonic() + 0.25,
-            operation="private staging cleanup",
-        )
-    except WorkerExecutionError:
-        # Staged file erasure is attempted through the retained root descriptor.
-        # Cleanup failure cannot delay Human STOP or enable public publication.
-        pass
+    child_sock.close()
+    return _receive_anonymous_fd_bounded(
+        parent_sock,
+        pid,
+        deadline=deadline,
+        operation="anonymous output staging creation",
+        require_sealed=False,
+        max_bytes=max_bytes,
+    )
 
 
-def _staging_descriptor_path(root_fd: int, name: str) -> str:
-    base = "/proc/self/fd" if sys.platform.startswith("linux") else "/dev/fd"
-    return "{}/{}/{}".format(base, root_fd, name)
-
-
-def _copy_regular_input_from_scope(
+def _stage_regular_input_anonymous_bounded(
     scope_fd: int,
     relative: Path,
-    target: Path,
     *,
-    target_dir_fd: Optional[int] = None,
     max_bytes: int,
     deadline: float,
-) -> None:
+) -> int:
+    """Copy authorized input into a sealed memfd before transferring it."""
+    _require_linux_anonymous_staging()
+    parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
     pid = os.fork()
     if pid == 0:
+        parent_sock.close()
         parent_fd = None
-        fd = None
+        source_fd = None
+        staged_fd = None
         try:
-            parent_fd, name = _open_parent_from_scope(scope_fd, relative, create_missing=False)
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
-            info = os.fstat(fd)
+            import fcntl
+
+            parent_fd, name = _open_parent_from_scope(
+                scope_fd,
+                relative,
+                create_missing=False,
+            )
+            source_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            info = os.fstat(source_fd)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 os._exit(3)
             if max_bytes <= 0 or info.st_size > max_bytes:
                 os._exit(2)
+
+            staged_fd = os.memfd_create(
+                "sunokiller-input",
+                flags=os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+            )
             copied = 0
-            if target_dir_fd is None:
-                destination_context = target.open("wb")
-            else:
-                destination_fd = os.open(
-                    target.name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=target_dir_fd,
-                )
-                destination_context = os.fdopen(destination_fd, "wb")
-            with os.fdopen(os.dup(fd), "rb") as source, destination_context as destination:
-                while True:
-                    chunk = source.read(min(1024 * 1024, max_bytes - copied + 1))
-                    if not chunk:
-                        break
-                    copied += len(chunk)
-                    if copied > max_bytes:
-                        os._exit(2)
-                    destination.write(chunk)
-                destination.flush()
-                os.fsync(destination.fileno())
+            while True:
+                chunk = os.read(source_fd, min(1024 * 1024, max_bytes - copied + 1))
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > max_bytes:
+                    os._exit(2)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(staged_fd, view)
+                    view = view[written:]
+
+            os.lseek(staged_fd, 0, os.SEEK_SET)
+            os.fchmod(staged_fd, 0o400)
+            fcntl.fcntl(staged_fd, fcntl.F_ADD_SEALS, _required_input_seals())
+            rights = array.array("i", [staged_fd])
+            child_sock.sendmsg([b"F"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
             os._exit(0)
         except (OSError, ResourceDenied):
             os._exit(3)
         except BaseException:
             os._exit(1)
-        finally:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            if parent_fd is not None:
-                try:
-                    os.close(parent_fd)
-                except OSError:
-                    pass
-    _wait_bounded_io_child(pid, deadline=deadline, operation="input staging")
+
+    child_sock.close()
+    return _receive_anonymous_fd_bounded(
+        parent_sock,
+        pid,
+        deadline=deadline,
+        operation="sealed anonymous input staging",
+        require_sealed=True,
+        max_bytes=max_bytes,
+    )
 
 
 def _atomic_commit_output_to_scope(
@@ -606,13 +719,12 @@ def _atomic_commit_output_to_scope(
 
 
 class _FilesystemStager:
-    """Broker filesystem access through trusted staging + bound directory fds.
+    """Broker filesystem inputs through sealed anonymous descriptors.
 
-    The worker and FFmpeg never receive caller-controlled authorized paths.
-    Inputs are copied from no-follow descriptors into a private staging
-    directory. Outputs are produced only in staging; bounded v0.1 refuses
-    caller-visible publication until a durable receipt-linked transaction
-    replaces the disabled commit boundary.
+    The worker never receives a caller-controlled authorized path. Input bytes
+    are copied into a sealed Linux memfd inside a killable bounded child.
+    Output receives an anonymous memfd only for dry-run contract construction;
+    bounded v0.1 rejects every native file-producing execution before launch.
     """
 
     def __init__(
@@ -627,11 +739,8 @@ class _FilesystemStager:
         self.policy = policy
         self.original_payload = dict(payload)
         self.execution_payload = dict(payload)
-        self._root_parent_fd = None
-        self._root_fd = None
-        self._root_name = None
         self._scope_fds = []
-        self._output_commits = []
+        self._staging_fds = []
         self._public_path_map = {}
         self._deadline = deadline
 
@@ -639,15 +748,9 @@ class _FilesystemStager:
         if not self.policy.filesystem_fields:
             return self
 
-        _require_posix_descriptor_containment()
-        (
-            self._root_parent_fd,
-            self._root_fd,
-            self._root_name,
-        ) = _make_private_staging_directory_bounded(deadline=self._deadline)
-
+        _require_linux_anonymous_staging()
         try:
-            for index, field in enumerate(self.policy.filesystem_inputs):
+            for field in self.policy.filesystem_inputs:
                 raw = self.original_payload.get(field)
                 if not isinstance(raw, str) or not raw:
                     raise WorkerExecutionError(
@@ -656,41 +759,38 @@ class _FilesystemStager:
                 scope, relative = _select_signed_filesystem_scope(self.lease, raw)
                 scope_fd = _open_directory_bounded(scope, deadline=self._deadline)
                 self._scope_fds.append(scope_fd)
-                suffix = Path(raw).suffix
-                staged_name = "input-{}{}".format(index, suffix)
-                staged = Path(staged_name)
-                _copy_regular_input_from_scope(
+                staged_fd = _stage_regular_input_anonymous_bounded(
                     scope_fd,
                     relative,
-                    staged,
-                    target_dir_fd=self._root_fd,
                     max_bytes=self.policy.max_input_bytes,
                     deadline=self._deadline,
                 )
-                staged_path = _staging_descriptor_path(self._root_fd, staged_name)
+                self._staging_fds.append(staged_fd)
+                staged_path = _anonymous_descriptor_path(staged_fd)
                 self.execution_payload[field] = staged_path
                 self._public_path_map[staged_path] = str(_normalized_absolute_path(raw))
 
-            for index, field in enumerate(self.policy.filesystem_outputs):
+            for field in self.policy.filesystem_outputs:
                 raw = self.original_payload.get(field)
                 if not isinstance(raw, str) or not raw:
                     raise WorkerExecutionError(
                         "payload resource field {} must be a non-empty path string".format(field)
                     )
-                scope, relative = _select_signed_filesystem_scope(self.lease, raw)
-                scope_fd = _open_directory_bounded(scope, deadline=self._deadline)
-                self._scope_fds.append(scope_fd)
-                suffix = Path(raw).suffix
-                staged_name = "output-{}{}".format(index, suffix)
-                staged_path = _staging_descriptor_path(self._root_fd, staged_name)
+                staged_fd = _make_anonymous_staging_file_bounded(
+                    label="sunokiller-output",
+                    max_bytes=self.policy.max_output_bytes,
+                    deadline=self._deadline,
+                )
+                self._staging_fds.append(staged_fd)
+                staged_path = _anonymous_descriptor_path(staged_fd)
                 self.execution_payload[field] = staged_path
-                self._output_commits.append((scope_fd, relative, Path(staged_path)))
+                self.execution_payload["_staged_output_suffix"] = Path(raw).suffix
                 self._public_path_map[staged_path] = str(_normalized_absolute_path(raw))
 
-            self.execution_payload["_descriptor_staging_fds"] = [self._root_fd]
+            self.execution_payload["_descriptor_staging_fds"] = list(self._staging_fds)
         except OSError as exc:
             self._cleanup()
-            raise ResourceDenied("descriptor-safe path authorization failed") from exc
+            raise ResourceDenied("anonymous descriptor staging failed") from exc
         except Exception:
             self._cleanup()
             raise
@@ -698,20 +798,16 @@ class _FilesystemStager:
         return self
 
     def commit_outputs(self) -> None:
-        if self.original_payload.get("dry_run"):
+        if self.original_payload.get("dry_run") is True:
             return
-        for scope_fd, relative, staged in self._output_commits:
-            _atomic_commit_output_to_scope(
-                scope_fd,
-                relative,
-                staged,
-                max_bytes=self.policy.max_output_bytes,
-                deadline=self._deadline,
-            )
+        raise WorkerExecutionError(
+            "public output publication is disabled until a durable receipt-linked "
+            "transaction is implemented"
+        )
 
     @property
     def pass_fds(self) -> Tuple[int, ...]:
-        return (self._root_fd,) if self._root_fd is not None else ()
+        return tuple(self._staging_fds)
 
     def restore_public_paths(self, result: Dict[str, Any]) -> Dict[str, Any]:
         restored = dict(result)
@@ -721,31 +817,13 @@ class _FilesystemStager:
         return restored
 
     def _cleanup(self) -> None:
-        for fd in self._scope_fds:
+        for fd in self._scope_fds + self._staging_fds:
             try:
                 os.close(fd)
             except OSError:
                 pass
         self._scope_fds.clear()
-        if (
-            self._root_parent_fd is not None
-            and self._root_fd is not None
-            and self._root_name is not None
-        ):
-            _remove_private_staging_directory_bounded(
-                self._root_parent_fd,
-                self._root_fd,
-                self._root_name,
-            )
-        for fd in (self._root_fd, self._root_parent_fd):
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-        self._root_parent_fd = None
-        self._root_fd = None
-        self._root_name = None
+        self._staging_fds.clear()
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self._cleanup()
@@ -754,10 +832,11 @@ class _FilesystemStager:
 class IsolatedRunner:
     """Run a registered, capability-leased worker in a separate interpreter.
 
-    The child receives only the JSON job payload plus trusted finite resource
-    limits and a minimized environment. It cannot write canonical state
-    directly; it may only propose `_state`, which the parent commits
-    transactionally after successful execution.
+    The child receives only a canonical byte-bounded JSON payload plus trusted
+    finite resource limits and a minimized environment. Bounded v0.1 rejects
+    worker-proposed state mutation and native file-producing execution because
+    neither SQLite finalization nor external publication is yet receipt-atomic
+    under forced preemption.
 
     Security contract:
     - exact worker code target must exist in the trusted worker-policy registry;
@@ -769,11 +848,11 @@ class IsolatedRunner:
       source root, never ambient CWD/PYTHONPATH import resolution;
     - POSIX CPU/memory limits are applied inside worker_entry after exec, not
       through preexec_fn in the multithreaded parent;
-    - filesystem workers use descriptor-bound, no-follow staging on POSIX;
+    - payload canonicalization is process-isolated, deadline-bound, and byte-limited;
+    - filesystem inputs use sealed anonymous Linux descriptors;
     - the worker never receives the original authorized filesystem paths;
-    - lease validity is rechecked after the subprocess returns;
-    - Human STOP/revocation and lease expiry are checked inside state commit;
-    - external output publication is linearized against STOP/revocation;
+    - lease validity is rechecked after the subprocess returns and before receipt;
+    - worker-proposed state and native output execution fail closed without a write transaction;
     - worker timeout terminates the entire descendant process tree/group.
     """
 
@@ -950,12 +1029,15 @@ class IsolatedRunner:
         worker: WorkerSpec,
         payload: Mapping[str, Any],
     ) -> Tuple[Dict[str, Any], ExecutionReceipt]:
-        input_payload = dict(payload)
         policy = self._policy_for(worker)
         limits = self._validated_limits(worker, policy)
-        started = int(time.time())
-        input_hash = digest_json(input_payload)
         deadline = time.monotonic() + float(limits["timeout_seconds"])
+        started = int(time.time())
+        input_payload, input_hash = _canonicalize_payload_bounded(
+            payload,
+            max_bytes=policy.max_payload_bytes,
+            deadline=deadline,
+        )
 
         policy = self._verify_worker_and_resources(
             lease=lease,
@@ -975,26 +1057,18 @@ class IsolatedRunner:
             ) from exc
         pre_hash = pre.state_hash if pre else digest_json({})
 
+        if policy.filesystem_outputs and input_payload.get("dry_run") is not True:
+            raise WorkerExecutionError(
+                "native file-producing execution is disabled in bounded v0.1; "
+                "only dry-run contract evaluation is authorized"
+            )
+
         with _FilesystemStager(
             lease=lease,
             policy=policy,
             payload=input_payload,
             deadline=deadline,
         ) as stager:
-            if policy.worker_id == "sunokiller.omen:mastering_worker" and not input_payload.get("dry_run"):
-                ffmpeg = self.trusted_executables.get("ffmpeg")
-                if not ffmpeg:
-                    raise WorkerExecutionError("trusted ffmpeg executable is not configured")
-                ffmpeg_path = Path(ffmpeg)
-                if (
-                    not ffmpeg_path.is_absolute()
-                    or ffmpeg_path.is_symlink()
-                    or not ffmpeg_path.is_file()
-                    or not os.access(str(ffmpeg_path), os.X_OK)
-                ):
-                    raise WorkerExecutionError("trusted ffmpeg executable must be an absolute executable regular file")
-                stager.execution_payload["_trusted_ffmpeg_path"] = str(ffmpeg_path)
-
             envelope = {
                 "module": worker.module,
                 "function": worker.function,
@@ -1029,9 +1103,6 @@ class IsolatedRunner:
             if not message.get("ok"):
                 raise WorkerExecutionError(message.get("error", "unknown worker error"))
 
-            # A long-running worker may cross lease expiry or be revoked while
-            # running. Revalidate signed authority before accepting any result
-            # or committing any staged output.
             policy = self._verify_worker_and_resources(
                 lease=lease,
                 worker=worker,
@@ -1043,61 +1114,25 @@ class IsolatedRunner:
 
             result = dict(message["result"])
             proposed_state = result.pop("_state", None)
-            output_commit_linearized = False
+            if proposed_state is not None:
+                raise WorkerExecutionError(
+                    "worker-proposed state mutation is disabled until durable "
+                    "transaction finalization can be deadline-supervised"
+                )
 
-            # File-producing workers write only into descriptor-retained private
-            # staging. Bounded v0.1 enters the durable lease guard but then
-            # refuses public publication; a future receipt-linked publisher
-            # must preserve this authority recheck without widening the gate.
-            if policy.filesystem_outputs and not input_payload.get("dry_run"):
-                try:
-                    with self.state_store.lease_commit_guard(
-                        lease.lease_id,
-                        expires_at=lease.expires_at,
-                        deadline_monotonic=deadline,
-                    ):
-                        stager.commit_outputs()
-                except StateDeadlineExceeded as exc:
-                    raise WorkerTimeout(
-                        "end-to-end execution deadline expired during output commit"
-                    ) from exc
-                output_commit_linearized = True
-            else:
-                stager.commit_outputs()
-
+            stager.commit_outputs()
             result = stager.restore_public_paths(result)
 
-            post_hash = pre_hash
-            if proposed_state is not None:
-                if not isinstance(proposed_state, dict):
-                    raise WorkerExecutionError("_state must be a dict")
-                try:
-                    snapshot = self.state_store.save_snapshot(
-                        self.state_key,
-                        proposed_state,
-                        expected_hash=pre.state_hash if pre else NO_SNAPSHOT_PRECONDITION,
-                        lease_id=lease.lease_id,
-                        lease_expires_at=lease.expires_at,
-                        deadline_monotonic=deadline,
-                    )
-                except StateDeadlineExceeded as exc:
-                    raise WorkerTimeout(
-                        "end-to-end execution deadline expired during state commit"
-                    ) from exc
-                post_hash = snapshot.state_hash
-            elif not output_commit_linearized:
-                # Stateless/no-side-effect work still needs one final durable
-                # authority check before its successful receipt is issued.
-                try:
-                    self.state_store.assert_lease_active(
-                        lease.lease_id,
-                        expires_at=lease.expires_at,
-                        deadline_monotonic=deadline,
-                    )
-                except StateDeadlineExceeded as exc:
-                    raise WorkerTimeout(
-                        "end-to-end execution deadline expired during final authority check"
-                    ) from exc
+            try:
+                self.state_store.assert_lease_active(
+                    lease.lease_id,
+                    expires_at=lease.expires_at,
+                    deadline_monotonic=deadline,
+                )
+            except StateDeadlineExceeded as exc:
+                raise WorkerTimeout(
+                    "end-to-end execution deadline expired during final authority check"
+                ) from exc
 
         finished = int(time.time())
         receipt = ExecutionReceipt(
@@ -1109,9 +1144,10 @@ class IsolatedRunner:
             started_at=started,
             finished_at=finished,
             pre_state_hash=pre_hash,
-            post_state_hash=post_hash,
+            post_state_hash=pre_hash,
             input_hash=input_hash,
             output_hash=digest_json(result),
             status="SUCCESS",
         )
         return result, self.authority.sign_receipt(receipt)
+
