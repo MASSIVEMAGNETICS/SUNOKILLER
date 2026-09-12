@@ -50,12 +50,14 @@ def build_master_command(
     loudness_range: float = 11.0,
     sample_rate: int = MASTER_SAMPLE_RATE,
     ffmpeg_path: str = "ffmpeg",
+    output_suffix: str | None = None,
 ) -> List[str]:
     _require_master_sample_rate(sample_rate)
     out = Path(output_path)
-    codec = _FORMAT_CODECS.get(out.suffix.lower())
+    selected_suffix = output_suffix or out.suffix
+    codec = _FORMAT_CODECS.get(selected_suffix.lower())
     if codec is None:
-        raise OmenError("unsupported output format: {}".format(out.suffix))
+        raise OmenError("unsupported output format: {}".format(selected_suffix))
     return [
         ffmpeg_path,
         "-hide_banner",
@@ -95,6 +97,7 @@ def master_file(
     dry_run: bool = False,
     ffmpeg_path: str | None = None,
     descriptor_staging_fds: Tuple[int, ...] = (),
+    staged_output_suffix: str | None = None,
 ) -> Dict[str, Any]:
     _require_master_sample_rate(sample_rate)
     staging_fds = tuple(int(fd) for fd in descriptor_staging_fds)
@@ -102,18 +105,19 @@ def master_file(
         raise OmenError("descriptor staging fds must be non-negative")
 
     if staging_fds:
+        if not dry_run:
+            raise OmenError(
+                "bounded descriptor mode is dry-run-only; native FFmpeg execution is disabled"
+            )
         source = Path(input_path)
         target = Path(output_path)
-        allowed_prefixes = tuple(
-            "{}/{}/".format(
-                "/proc/self/fd" if sys.platform.startswith("linux") else "/dev/fd",
-                fd,
-            )
+        allowed_paths = {
+            "/proc/self/fd/{}".format(fd)
             for fd in staging_fds
-        )
-        if not any(str(source).startswith(prefix) for prefix in allowed_prefixes):
+        }
+        if str(source) not in allowed_paths:
             raise OmenError("descriptor-staged input path is not bound to a retained fd")
-        if not any(str(target).startswith(prefix) for prefix in allowed_prefixes):
+        if str(target) not in allowed_paths:
             raise OmenError("descriptor-staged output path is not bound to a retained fd")
     else:
         source = Path(input_path).expanduser().resolve()
@@ -132,6 +136,7 @@ def master_file(
         loudness_range=loudness_range,
         sample_rate=MASTER_SAMPLE_RATE,
         ffmpeg_path=ffmpeg_path or "ffmpeg",
+        output_suffix=staged_output_suffix,
     )
 
     if dry_run:
@@ -186,6 +191,7 @@ def mastering_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
         dry_run=bool(payload.get("dry_run", False)),
         ffmpeg_path=payload.get("_trusted_ffmpeg_path"),
         descriptor_staging_fds=tuple(payload.get("_descriptor_staging_fds", ())),
+        staged_output_suffix=payload.get("_staged_output_suffix"),
     )
 
 
