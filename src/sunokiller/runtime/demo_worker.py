@@ -8,7 +8,7 @@ def update_counter(payload):
     if delay > 0:
         time.sleep(delay)
     value = int(payload.get("value", 0))
-    return {
-        "value": value + 1,
-        "_state": {"counter": value + 1},
-    }
+    result = {"value": value + 1}
+    if payload.get("propose_state") is True:
+        result["_state"] = {"counter": value + 1}
+    return result
