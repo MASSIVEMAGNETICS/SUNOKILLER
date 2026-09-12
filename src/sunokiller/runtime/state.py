@@ -201,17 +201,19 @@ class SQLiteStateStore:
         expires_at: Optional[int] = None,
         deadline_monotonic: Optional[float] = None,
     ) -> Iterator[None]:
-        """Linearize one bounded external side effect against STOP/revocation.
+        """Serialize an administrative side effect against STOP/revocation.
 
-        The guard acquires SQLite's write lock with BEGIN IMMEDIATE, checks the
-        lease only after that lock is held, then retains the transaction until
-        the guarded external commit finishes. A concurrent revoke either lands
-        first and blocks the side effect, or waits until the already-authorized
-        side effect has completed. This is intended for short finalization
-        operations such as atomically publishing a staged output file; long
-        worker execution must never run inside this guard.
+        SQLite COMMIT and ROLLBACK cannot be forcibly bounded in-process.
+        Therefore bounded execution contexts are refused before BEGIN; only
+        explicit administrative callers without an execution deadline may use
+        this legacy guard.
         """
-        with self._locked_until(deadline_monotonic):
+        if deadline_monotonic is not None:
+            raise StateDeadlineExceeded(
+                "deadline-bound external commits are disabled until transaction "
+                "finalization is killably supervised"
+            )
+        with self._locked_until(None):
             with self._immediate_transaction(deadline_monotonic):
                 self._assert_lease_active_locked(lease_id, expires_at=expires_at)
                 yield
@@ -226,14 +228,18 @@ class SQLiteStateStore:
         lease_expires_at: Optional[int] = None,
         deadline_monotonic: Optional[float] = None,
     ) -> StateSnapshot:
-        """Commit state with optimistic concurrency and an atomic lease gate.
+        """Commit administrative state with optimistic concurrency.
 
-        When lease_id is supplied, Human STOP/revocation and lease expiry are
-        both checked *after* BEGIN IMMEDIATE acquires SQLite's write lock and
-        before the state precondition or insert is evaluated. A writer that was
-        valid before blocking cannot mutate canonical state after its lease
-        expires while waiting for the database.
+        Bounded execution contexts pass a monotonic deadline and are refused
+        before serialization or BEGIN because SQLite COMMIT/ROLLBACK I/O cannot
+        be forcibly interrupted in-process. Legacy administrative calls without
+        a deadline retain the serialized lease/expiry checks.
         """
+        if deadline_monotonic is not None:
+            raise StateDeadlineExceeded(
+                "deadline-bound state mutation is disabled until transaction "
+                "finalization is killably supervised"
+            )
         payload = dict(state)
         state_json = canonical_json(payload)
         state_hash = digest_json(payload)
