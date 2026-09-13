@@ -9,6 +9,7 @@ import os
 import signal
 import socket
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -96,8 +97,11 @@ class SQLiteStateStore:
         )
         if self._bounded_path is None:
             self._bounded_identity = None
+            self._bounded_fd = None
         else:
-            info = os.stat(self._bounded_path)
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            self._bounded_fd = os.open(self._bounded_path, flags)
+            info = os.fstat(self._bounded_fd)
             self._bounded_identity = (info.st_dev, info.st_ino)
 
     @staticmethod
@@ -169,6 +173,9 @@ class SQLiteStateStore:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+            if self._bounded_fd is not None:
+                os.close(self._bounded_fd)
+                self._bounded_fd = None
 
     def _read_scalar_bounded(
         self,
@@ -187,9 +194,17 @@ class SQLiteStateStore:
             raise StateDeadlineExceeded(
                 "deadline-bound state reads require POSIX process isolation in v0.1"
             )
-        if self._bounded_path is None or self._bounded_identity is None:
+        if (
+            self._bounded_path is None
+            or self._bounded_identity is None
+            or self._bounded_fd is None
+        ):
             raise StateDeadlineExceeded(
                 "bounded execution requires a stable file-backed state store"
+            )
+        if not sys.platform.startswith("linux"):
+            raise StateDeadlineExceeded(
+                "object-bound SQLite reads require Linux proc descriptors in v0.1"
             )
         self._assert_deadline(deadline_monotonic)
 
@@ -200,7 +215,15 @@ class SQLiteStateStore:
             connection = None
             try:
                 # Never use the inherited connection or parent RLock after fork.
-                database_uri = Path(self._bounded_path).as_uri() + "?mode=ro"
+                descriptor_info = os.fstat(self._bounded_fd)
+                if (
+                    descriptor_info.st_dev,
+                    descriptor_info.st_ino,
+                ) != self._bounded_identity:
+                    os._exit(3)
+                database_uri = "file:/proc/self/fd/{}?mode=ro".format(
+                    self._bounded_fd
+                )
                 connection = sqlite3.connect(
                     database_uri,
                     check_same_thread=False,
@@ -209,11 +232,11 @@ class SQLiteStateStore:
                     uri=True,
                 )
                 connection.execute("PRAGMA query_only=ON")
-                database_row = connection.execute("PRAGMA database_list").fetchone()
-                if database_row is None or not database_row[2]:
-                    os._exit(3)
-                database_info = os.stat(database_row[2])
-                if (database_info.st_dev, database_info.st_ino) != self._bounded_identity:
+                descriptor_info = os.fstat(self._bounded_fd)
+                if (
+                    descriptor_info.st_dev,
+                    descriptor_info.st_ino,
+                ) != self._bounded_identity:
                     os._exit(3)
                 row = connection.execute(query, (parameter,)).fetchone()
                 value = None if row is None else row[0]

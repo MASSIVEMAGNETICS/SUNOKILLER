@@ -326,7 +326,29 @@ class HMACAuthority:
     ) -> None:
         if type(lease) is not CapabilityLease:
             raise InvalidSignature("lease must use the trusted contract type")
-        if type(lease.signature) is not str or len(lease.signature) != 64:
+        scalar_fields = (
+            lease.lease_id,
+            lease.issuer,
+            lease.subject,
+            lease.nonce,
+            lease.signature,
+        )
+        if any(type(value) is not str for value in scalar_fields):
+            raise InvalidSignature("lease scalar fields must use exact string types")
+        if type(lease.not_before) is not int or type(lease.expires_at) is not int:
+            raise InvalidSignature("lease validity fields must use exact integer types")
+        if (
+            type(lease.capabilities) is not tuple
+            or any(type(value) is not str for value in lease.capabilities)
+            or type(lease.resource_scopes) is not tuple
+            or any(type(value) is not str for value in lease.resource_scopes)
+        ):
+            raise InvalidSignature(
+                "lease authority fields must use immutable tuples of exact strings"
+            )
+        if type(lease.metadata) is not dict:
+            raise InvalidSignature("lease metadata must use the trusted JSON object type")
+        if len(lease.signature) != 64:
             raise InvalidSignature("lease signature has an invalid representation")
         try:
             expected = self._sign_payload(lease.unsigned_payload())

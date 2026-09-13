@@ -15,6 +15,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -113,6 +114,12 @@ _TRUSTED_WORKER_POLICIES = {
 # user-site and other Python environment influence; this path is then inserted
 # explicitly inside the fresh interpreter before worker_entry is imported.
 _TRUSTED_SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
+
+# Aggregate admission is part of the trusted in-process runtime boundary. A
+# request must hold one slot before the first helper fork and retains it until
+# every worker, helper, descriptor, and receipt path has completed or unwound.
+_MAX_CONCURRENT_EXECUTIONS = 2
+_EXECUTION_ADMISSION = threading.BoundedSemaphore(_MAX_CONCURRENT_EXECUTIONS)
 
 
 def _minimal_environment() -> Dict[str, str]:
@@ -1076,17 +1083,17 @@ class IsolatedRunner:
 
         return process.returncode, stdout, stderr
 
-    def execute(
+    def _execute_admitted(
         self,
         *,
         lease: CapabilityLease,
         worker: WorkerSpec,
         payload: Mapping[str, Any],
+        policy: WorkerPolicy,
+        limits: Mapping[str, Any],
+        deadline: float,
+        started: int,
     ) -> Tuple[Dict[str, Any], ExecutionReceipt]:
-        policy = self._policy_for(worker)
-        limits = self._validated_limits(worker, policy)
-        deadline = time.monotonic() + float(limits["timeout_seconds"])
-        started = int(time.time())
         # Bound and authenticate the lease before any helper fork. Otherwise an
         # attacker-sized forged lease would still inflate fork/page-table cost.
         self._verify_signed_lease(lease=lease, policy=policy)
@@ -1207,3 +1214,32 @@ class IsolatedRunner:
             status="SUCCESS",
         )
         return result, self.authority.sign_receipt(receipt)
+
+    def execute(
+        self,
+        *,
+        lease: CapabilityLease,
+        worker: WorkerSpec,
+        payload: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], ExecutionReceipt]:
+        policy = self._policy_for(worker)
+        limits = self._validated_limits(worker, policy)
+        deadline = time.monotonic() + float(limits["timeout_seconds"])
+        started = int(time.time())
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not _EXECUTION_ADMISSION.acquire(timeout=remaining):
+            raise WorkerTimeout(
+                "trusted aggregate execution capacity was not available before deadline"
+            )
+        try:
+            return self._execute_admitted(
+                lease=lease,
+                worker=worker,
+                payload=payload,
+                policy=policy,
+                limits=limits,
+                deadline=deadline,
+                started=started,
+            )
+        finally:
+            _EXECUTION_ADMISSION.release()

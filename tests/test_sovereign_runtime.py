@@ -178,6 +178,24 @@ class CapabilityBoundaryTests(unittest.TestCase):
                     payload={"value": 4},
                 )
 
+    def test_mutable_authority_fields_cannot_reuse_a_valid_signature(self):
+        lease = self.issue()
+        forged_capabilities = dataclasses.replace(
+            lease,
+            capabilities=list(lease.capabilities),
+        )
+        forged_scopes = dataclasses.replace(
+            lease,
+            resource_scopes=list(lease.resource_scopes),
+        )
+        for forged in (forged_capabilities, forged_scopes):
+            with self.assertRaises(InvalidSignature):
+                self.authority.verify_lease(
+                    forged,
+                    required_capability="audio.master",
+                    resource="catalog/masters/x.wav",
+                )
+
     def test_state_mismatch_rejected(self):
         first = self.store.save_snapshot("runtime", {"v": 1})
         self.store.save_snapshot("runtime", {"v": 2}, expected_hash=first.state_hash)
@@ -311,6 +329,56 @@ class CapabilityBoundaryTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 1.0)
         self.assertIsNone(self.store.load_latest("runtime"))
 
+    def test_exhausted_aggregate_admission_cannot_reach_helper_fork(self):
+        gate = threading.BoundedSemaphore(1)
+        self.assertTrue(gate.acquire(blocking=False))
+        worker = dataclasses.replace(self.demo_worker(), timeout_seconds=0.05)
+        started = time.monotonic()
+        try:
+            with mock.patch.object(
+                runner_module,
+                "_EXECUTION_ADMISSION",
+                gate,
+            ), mock.patch.object(
+                runner_module.os,
+                "fork",
+                side_effect=AssertionError("capacity exhaustion must precede fork"),
+            ):
+                with self.assertRaises(WorkerTimeout):
+                    self.runner().execute(
+                        lease=self.issue(),
+                        worker=worker,
+                        payload={"value": 4},
+                    )
+        finally:
+            gate.release()
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_aggregate_admission_is_retained_until_unwind_then_released(self):
+        gate = threading.BoundedSemaphore(1)
+
+        def assert_slot_held(*args, **kwargs):
+            self.assertFalse(gate.acquire(blocking=False))
+            raise WorkerExecutionError("injected admitted-path failure")
+
+        with mock.patch.object(
+            runner_module,
+            "_EXECUTION_ADMISSION",
+            gate,
+        ), mock.patch.object(
+            runner_module,
+            "_canonicalize_payload_bounded",
+            side_effect=assert_slot_held,
+        ):
+            with self.assertRaisesRegex(WorkerExecutionError, "injected admitted-path"):
+                self.runner().execute(
+                    lease=self.issue(),
+                    worker=self.demo_worker(),
+                    payload={"value": 4},
+                )
+        self.assertTrue(gate.acquire(blocking=False))
+        gate.release()
+
     @unittest.skipUnless(os.name == "posix", "killable state reads require POSIX")
     def test_bounded_reads_remain_bound_to_original_database_after_cwd_change(self):
         with tempfile.TemporaryDirectory() as work:
@@ -354,6 +422,37 @@ class CapabilityBoundaryTests(unittest.TestCase):
                     decoy_store.close()
                 if bound_store is not None:
                     bound_store.close()
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"),
+        "object-bound state reads require Linux proc descriptors",
+    )
+    def test_bounded_reads_follow_open_database_object_across_path_swap(self):
+        with tempfile.TemporaryDirectory() as work:
+            database = Path(work) / "runtime.sqlite3"
+            original_object = Path(work) / "original.sqlite3"
+            bound_store = SQLiteStateStore(str(database))
+            decoy_store = None
+            try:
+                lease = self.issue()
+                bound_store.revoke_lease(lease.lease_id, "human stop")
+                bound_store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                os.replace(database, original_object)
+
+                decoy_store = SQLiteStateStore(str(database))
+                decoy_store.close()
+                decoy_store = None
+
+                self.assertTrue(
+                    bound_store.is_revoked(
+                        lease.lease_id,
+                        deadline_monotonic=time.monotonic() + 1.0,
+                    )
+                )
+            finally:
+                if decoy_store is not None:
+                    decoy_store.close()
+                bound_store.close()
 
     @unittest.skipUnless(os.name == "posix", "killable state reads require POSIX")
     def test_in_memory_state_store_fails_closed_for_bounded_execution(self):
