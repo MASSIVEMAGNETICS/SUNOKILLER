@@ -1,57 +1,61 @@
-"""SUNOKILLER - Advanced Audio Synthesis System
+"""SUNOKILLER - Advanced Audio Synthesis System.
 
-A state-of-the-art audio synthesis system using cutting-edge techniques:
-- Vocos: Fourier-based neural vocoder for 10x speedup
-- DiffWave/SpecDiff-GAN: Fast diffusion models
-- Transformer-based text-to-music generation
-- Singing voice synthesis
-- INT8/FP16 quantization for low-end hardware
-- Voice cloning from audio samples
-- Real-time streaming generation
-- Pre-trained model weights
-- Training scripts and datasets
-- Web UI and mobile deployment support
+The package root intentionally avoids importing heavyweight neural/model
+modules at import time. Lightweight subsystems such as ``sunokiller.runtime``
+must remain usable without installing the full ML dependency stack.
 
-Based on latest research from 2024-2025.
+Heavy public API symbols are loaded lazily on first attribute access so the
+historical root-level API remains available when its optional dependencies are
+installed.
 """
+
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Dict, Tuple
 
 __version__ = "0.1.0"
 __author__ = "MASSIVEMAGNETICS"
 
-from .models import VocosVocoder, DiffusionModel, TextToMusicModel, MusicDiffusionTransformer
-from .synthesis import AudioSynthesizer
-from .quantization import quantize_model
-from .pretrained import (
-    load_pretrained_weights,
-    create_model_from_pretrained,
-    list_available_models,
-)
-from .voice_cloning import VoiceCloner, extract_voice_from_file
-from .streaming import StreamingGenerator, create_streaming_synthesizer
 
-__all__ = [
+_LAZY_EXPORTS: Dict[str, Tuple[str, str]] = {
     # Core models
-    "VocosVocoder",
-    "DiffusionModel", 
-    "TextToMusicModel",
-    "MusicDiffusionTransformer",
-    
+    "VocosVocoder": (".models", "VocosVocoder"),
+    "DiffusionModel": (".models", "DiffusionModel"),
+    "TextToMusicModel": (".models", "TextToMusicModel"),
+    "MusicDiffusionTransformer": (".models", "MusicDiffusionTransformer"),
     # Synthesis
-    "AudioSynthesizer",
-    
+    "AudioSynthesizer": (".synthesis", "AudioSynthesizer"),
     # Optimization
-    "quantize_model",
-    
+    "quantize_model": (".quantization", "quantize_model"),
     # Pre-trained models
-    "load_pretrained_weights",
-    "create_model_from_pretrained",
-    "list_available_models",
-    
+    "load_pretrained_weights": (".pretrained", "load_pretrained_weights"),
+    "create_model_from_pretrained": (".pretrained", "create_model_from_pretrained"),
+    "list_available_models": (".pretrained", "list_available_models"),
     # Voice cloning
-    "VoiceCloner",
-    "extract_voice_from_file",
-    
+    "VoiceCloner": (".voice_cloning", "VoiceCloner"),
+    "extract_voice_from_file": (".voice_cloning", "extract_voice_from_file"),
     # Streaming
-    "StreamingGenerator",
-    "create_streaming_synthesizer",
-]
+    "StreamingGenerator": (".streaming", "StreamingGenerator"),
+    "create_streaming_synthesizer": (".streaming", "create_streaming_synthesizer"),
+}
+
+
+__all__ = list(_LAZY_EXPORTS)
+
+
+def __getattr__(name: str):
+    """Load heavyweight root exports only when the caller actually asks for one."""
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError("module {!r} has no attribute {!r}".format(__name__, name))
+
+    module_name, attribute_name = target
+    module = import_module(module_name, __name__)
+    value = getattr(module, attribute_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))
