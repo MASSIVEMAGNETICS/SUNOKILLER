@@ -7,6 +7,8 @@ SUNOKILLER is an advanced audio synthesis system that generates high-quality, hu
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
+> **Release-evidence status (2026-11-14):** This README's checked roadmap items describe repository feature implementations, **not independently verified production readiness**. The closing note below says pretrained weights and training scripts are still under development, while [ROADMAP_COMPLETION.md](ROADMAP_COMPLETION.md) reports their implementation and [PROJECT_STATS.md](PROJECT_STATS.md) (last updated November 2025) lists them as future work. These records conflict. Treat pretrained model availability, training reproducibility, mobile/plugin builds, benchmark figures, and production suitability as **NOT VERIFIED** until artifact links, exact commit/test commands, supported hardware, and results are published. Do not interpret the performance table as independently reproduced measurements. No existing runtime behavior is changed by this notice.
+
 ## 🚀 Features
 
 ### Cutting-Edge Technology (2024-2025 Research)
