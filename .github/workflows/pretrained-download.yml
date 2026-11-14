@@ -1,0 +1,38 @@
+name: Pretrained Download Cache Contracts
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/sunokiller/pretrained.py"
+      - "tests/test_pretrained_download.py"
+      - ".github/workflows/pretrained-download.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/sunokiller/pretrained.py"
+      - "tests/test_pretrained_download.py"
+      - ".github/workflows/pretrained-download.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  download-cache-contract:
+    name: download-cache-contract (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run offline download/cache regressions
+        run: python -m unittest -v tests.test_pretrained_download

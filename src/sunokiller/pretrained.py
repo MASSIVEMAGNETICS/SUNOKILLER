@@ -10,6 +10,7 @@ import torch
 from pathlib import Path
 from typing import Optional, Dict, Any
 import json
+import tempfile
 from urllib.request import urlretrieve
 from tqdm import tqdm
 
@@ -64,13 +65,64 @@ class DownloadProgressBar(tqdm):
         self.update(b * bsize - self.n)
 
 
-def download_file(url: str, output_path: Path, description: str = "Downloading"):
-    """Download a file with progress bar."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with DownloadProgressBar(unit='B', unit_scale=True, miniters=1, desc=description) as t:
-        urlretrieve(url, output_path, reporthook=t.update_to)
+def _is_nonempty_file(path: Path) -> bool:
+    """Return whether path is a regular, non-empty cached artifact."""
+    try:
+        path = Path(path)
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
 
+
+def _write_json_atomically(path: Path, data: Dict[str, Any]) -> None:
+    """Write fallback configuration without exposing a partial cache file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def download_file(url: str, output_path: Path, description: str = "Downloading"):
+    """Download to a same-directory temporary file, then atomically publish it.
+
+    A failed or empty transfer never replaces an existing cache entry and
+    never leaves a partial file at the canonical cache path.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".part",
+        dir=str(output_path.parent),
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        with DownloadProgressBar(unit="B", unit_scale=True, miniters=1, desc=description) as t:
+            urlretrieve(url, temp_path, reporthook=t.update_to)
+        if not _is_nonempty_file(temp_path):
+            raise OSError(f"Downloaded file is empty or missing: {url}")
+        os.replace(temp_path, output_path)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 def list_available_models() -> Dict[str, Dict[str, Any]]:
     """List all available pre-trained models."""
@@ -111,7 +163,7 @@ def download_pretrained_model(
     config_path = model_dir / "config.json"
     
     # Download model weights if needed
-    if not model_path.exists() or force_download:
+    if not _is_nonempty_file(model_path) or force_download:
         print(f"Downloading {model_name} model weights...")
         try:
             download_file(
@@ -122,11 +174,10 @@ def download_pretrained_model(
         except Exception as e:
             print(f"Warning: Could not download model weights: {e}")
             print("Models will be initialized with random weights.")
-            # Create a placeholder file to indicate download was attempted
-            model_path.touch()
+            # Leave the canonical cache path absent so a later call can retry.
     
     # Download config if needed
-    if "config_url" in model_info and (not config_path.exists() or force_download):
+    if "config_url" in model_info and (not _is_nonempty_file(config_path) or force_download):
         print(f"Downloading {model_name} config...")
         try:
             download_file(
@@ -136,10 +187,10 @@ def download_pretrained_model(
             )
         except Exception as e:
             print(f"Warning: Could not download config: {e}")
-            # Create default config
-            config = {k: v for k, v in model_info.items() if k not in ["url", "config_url"]}
-            with open(config_path, 'w') as f:
-                json.dump(config, f, indent=2)
+            # Preserve a previously valid cache during failed forced refreshes.
+            if not _is_nonempty_file(config_path):
+                config = {k: v for k, v in model_info.items() if k not in ["url", "config_url"]}
+                _write_json_atomically(config_path, config)
     
     return {
         "model": model_path,
@@ -172,8 +223,9 @@ def load_pretrained_weights(
     """
     paths = download_pretrained_model(model_name)
     
-    # Check if model file is empty (placeholder from failed download)
-    if paths["model"].stat().st_size == 0:
+    # A failed first download leaves no canonical file; retain the existing
+    # explicit random-initialization fallback without poisoning future retries.
+    if not _is_nonempty_file(paths["model"]):
         print(f"Warning: No pre-trained weights available for {model_name}")
         print("Using randomly initialized weights.")
         return model
